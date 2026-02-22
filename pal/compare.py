@@ -14,7 +14,7 @@ from .acquisition import get_acquisition
 from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
 from .data import generate_zinc_dataset, load_dataset_from_file
-from .featurizer import compute_ecfp
+from .featurizer import LazyECFP, compute_ecfp
 from .loop import ALState, run_al_loop
 from .model import build_model, mc_predict, predict_eval, train_model
 from .pareto import build_stair_polygon, hypervolume_2d, pareto_front_2d
@@ -552,6 +552,9 @@ def main() -> None:
                         help="Precomputed fingerprint column (optional)")
     parser.add_argument("--ref_point", type=float, nargs=2, default=[0.0, 0.0],
                         help="HV reference point (default: 0.0 0.0)")
+    parser.add_argument("--lazy-fingerprints", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Compute ECFP fingerprints lazily on demand (default: on)")
     args = parser.parse_args()
 
     config = ExperimentConfig()
@@ -593,12 +596,13 @@ def main() -> None:
             X_pool = X_precomputed
             config.model.in_features = X_pool.shape[1]
         else:
-            print("Computing ECFP fingerprints ...")
-            X_pool = compute_ecfp(
-                df[args.smiles_col].tolist(),
-                radius=config.ecfp_radius,
-                n_bits=config.ecfp_nbits,
-            )
+            smiles = df[args.smiles_col].tolist()
+            if args.lazy_fingerprints:
+                print("Using lazy ECFP fingerprints (computed on demand) ...")
+                X_pool = LazyECFP(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
+            else:
+                print("Computing ECFP fingerprints ...")
+                X_pool = compute_ecfp(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
     else:
         print("Generating ZINC dataset ...")
         df = generate_zinc_dataset(
@@ -606,12 +610,13 @@ def main() -> None:
         )
         Y_pool = df[["sa_score", "qed"]].values.astype(np.float32)
         config.obj_names = ("SA score (10 - raw)", "QED")
-        print("Computing ECFP fingerprints ...")
-        X_pool = compute_ecfp(
-            df["smiles"].tolist(),
-            radius=config.ecfp_radius,
-            n_bits=config.ecfp_nbits,
-        )
+        smiles = df["smiles"].tolist()
+        if args.lazy_fingerprints:
+            print("Using lazy ECFP fingerprints (computed on demand) ...")
+            X_pool = LazyECFP(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
+        else:
+            print("Computing ECFP fingerprints ...")
+            X_pool = compute_ecfp(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
 
     oracle_hv = hypervolume_2d(Y_pool, config.al.ref_point)
     print(f"Oracle HV = {oracle_hv:.4f}  (pool size = {len(Y_pool)})\n")
