@@ -118,6 +118,8 @@ def run_al_loop(
 
         # 1. train model from scratch (on normalized targets)
         model = build_model(mcfg, device=config.device)
+        if hasattr(X_pool, 'precompute'):
+            X_pool.precompute(state.labeled_indices)
         X_train = X_pool[state.labeled_indices]
         Y_train = state.Y_labeled
 
