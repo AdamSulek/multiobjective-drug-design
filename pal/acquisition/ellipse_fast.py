@@ -91,7 +91,7 @@ class FastEllipseAcquisition(AcquisitionFunction):
         flat_dhv = batch_delta_hv_2d(front, flat_points, ref_point)  # (K,)
 
         # --- 6. Max delta-HV per candidate ---
-        scores = np.zeros(N, dtype=np.float64)
+        scores = np.full(N, -np.inf, dtype=np.float64)
         np.maximum.at(scores, flat_cand, flat_dhv)
 
         return scores.astype(np.float32)

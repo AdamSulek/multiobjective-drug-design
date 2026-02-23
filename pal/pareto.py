@@ -76,18 +76,65 @@ def stair_y_at_x(front: np.ndarray, x: float, ref: Tuple[float, float]) -> float
     return float(ys[i])
 
 
+def stair_x_at_y(front: np.ndarray, y: float, ref: Tuple[float, float]) -> float:
+    """Return the x-coordinate of the staircase boundary at coordinate *y*.
+
+    Mirror of ``stair_y_at_x``.  For a dominated point at height *y* this
+    gives the horizontal distance it must travel rightward to reach the front.
+    """
+    rx, ry = float(ref[0]), float(ref[1])
+    if y <= ry or len(front) == 0:
+        return rx
+
+    fy = front[:, 1]  # ascending
+    fx = front[:, 0]  # descending
+
+    # y is above the entire front
+    if y >= fy[-1]:
+        return rx
+
+    # first front index whose fy >= y
+    k = int(np.searchsorted(fy, y, side="left"))
+    return float(fx[k])
+
+
 def delta_hv_contribution(
     front: np.ndarray, x: float, y: float, ref: Tuple[float, float]
 ) -> float:
-    """Exact hypervolume improvement of a single candidate point (x, y)."""
+    """Exact hypervolume improvement of a single candidate point (x, y).
+
+    Returns a positive delta for non-dominated points and a negative
+    area-gap score for dominated / behind-ref points so that candidates
+    closer to the front rank higher (less negative).
+
+    Dominated scoring uses ``-(dist_v * dist_h)`` (gap-rectangle area)
+    when both axes are positive, or ``-(d²)`` when only one axis is
+    positive, keeping the result in area units.
+    """
     rx, ry = float(ref[0]), float(ref[1])
-    if x <= rx or y <= ry:
-        return 0.0
-    hv_old = hypervolume_2d(front, ref) if len(front) > 0 else 0.0
-    new_points = (np.vstack([front, [[x, y]]]) if len(front) > 0
-                  else np.array([[x, y]]))
-    hv_new = hypervolume_2d(new_points, ref)
-    return float(hv_new - hv_old)
+
+    # Non-dominated path: positive HV delta
+    if x > rx and y > ry:
+        hv_old = hypervolume_2d(front, ref) if len(front) > 0 else 0.0
+        new_points = (np.vstack([front, [[x, y]]]) if len(front) > 0
+                      else np.array([[x, y]]))
+        hv_new = hypervolume_2d(new_points, ref)
+        delta = float(hv_new - hv_old)
+        if delta > 0.0:
+            return delta
+
+    # Dominated or behind-ref: negative distance to staircase
+    dist_v = stair_y_at_x(front, x, ref) - y
+    dist_h = stair_x_at_y(front, y, ref) - x
+    dv_pos = dist_v > 0
+    dh_pos = dist_h > 0
+    if dv_pos and dh_pos:
+        return -(dist_v * dist_h)
+    if dv_pos:
+        return -(dist_v * dist_v)
+    if dh_pos:
+        return -(dist_h * dist_h)
+    return 0.0
 
 
 def batch_delta_hv_2d(
@@ -114,7 +161,8 @@ def batch_delta_hv_2d(
     Returns
     -------
     np.ndarray, shape ``(B,)``
-        Delta-HV for each candidate (0 if dominated or behind ref).
+        Delta-HV for each candidate (negative area-gap score if dominated
+        or behind ref).
     """
     rx, ry = float(ref[0]), float(ref[1])
     cands = np.asarray(candidates, dtype=float).reshape(-1, 2)
@@ -132,6 +180,21 @@ def batch_delta_hv_2d(
     if len(front) == 0 or front.shape[0] == 0:
         delta = np.zeros(B, dtype=float)
         delta[valid] = (px[valid] - rx) * (py[valid] - ry)
+        # Behind-ref: negative distance to reference corner
+        need_dist = ~valid
+        if np.any(need_dist):
+            dist_v = ry - py
+            dist_h = rx - px
+            dv_pos = dist_v > 0
+            dh_pos = dist_h > 0
+            both = dv_pos & dh_pos
+            only_v = dv_pos & ~dh_pos
+            only_h = dh_pos & ~dv_pos
+            area = np.zeros(B, dtype=float)
+            area[both] = dist_v[both] * dist_h[both]
+            area[only_v] = dist_v[only_v] ** 2
+            area[only_h] = dist_h[only_h] ** 2
+            delta[need_dist] = -area[need_dist]
         return delta
 
     front = np.asarray(front, dtype=float)
@@ -144,6 +207,8 @@ def batch_delta_hv_2d(
 
     # y_below[b] = fy[j-1] if j > 0 else ry  (stair height at x = px)
     y_below = np.where(j > 0, fy[np.clip(j - 1, 0, M - 1)], ry)
+    # Fix: points left of / at ref should see ry, not fy[-1]
+    y_below = np.where(px <= rx, ry, y_below)
 
     # Dominated: py <= stair height at x = px
     dominated = py <= y_below
@@ -175,8 +240,28 @@ def batch_delta_hv_2d(
         - (prefix_sum[k] - prefix_sum[j])
     )
 
-    delta[dominated | ~valid] = 0.0
+    # Non-dominated: keep positive delta
+    non_dom = valid & ~dominated
+    delta[~non_dom] = 0.0
     delta = np.maximum(delta, 0.0)
+
+    # Dominated/behind-ref: negative distance to stair
+    need_dist = dominated | ~valid
+    if np.any(need_dist):
+        dist_v = y_below - py
+        stair_x = np.where(py <= ry, rx, fx_at_k)
+        dist_h = stair_x - px
+        dv_pos = dist_v > 0
+        dh_pos = dist_h > 0
+        both = dv_pos & dh_pos
+        only_v = dv_pos & ~dh_pos
+        only_h = dh_pos & ~dv_pos
+        area = np.zeros(B, dtype=float)
+        area[both] = dist_v[both] * dist_h[both]
+        area[only_v] = dist_v[only_v] ** 2
+        area[only_h] = dist_h[only_h] ** 2
+        delta[need_dist] = -area[need_dist]
+
     return delta
 
 

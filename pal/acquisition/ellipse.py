@@ -69,7 +69,7 @@ class EllipseAcquisition(AcquisitionFunction):
             # Points on k-sigma ellipse: mu + k * L @ [cos(theta), sin(theta)]
             points = mu + self.k * (circle @ L.T)  # (n_angles, 2)
 
-            best = 0.0
+            best = -np.inf
             for j in range(self.n_angles):
                 dhv = delta_hv_contribution(
                     front, points[j, 0], points[j, 1], ref_point
