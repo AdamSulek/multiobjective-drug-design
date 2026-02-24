@@ -1,6 +1,7 @@
 """Run multiple acquisition strategies and plot convergence (CLI entry)."""
 
 import argparse
+from asyncio.log import logger
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,38 @@ from .loop import ALState, run_al_loop
 from .model import build_model, mc_predict, predict_eval, train_model
 from .pareto import build_stair_polygon, hypervolume_2d, pareto_front_2d
 from .visualize import generate_acquisition_explanations
+import logging
+import sys
+
+def setup_logging(output_dir: str) -> logging.Logger:
+    logger = logging.getLogger("pal")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    # usuń stare handlery (ważne przy wielokrotnym uruchamianiu)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # log do pliku
+    file_handler = logging.FileHandler(
+        os.path.join(output_dir, "compare.log"),
+        mode="w"
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # log do stdout
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
 
 @dataclass
 class StrategyResult:
@@ -45,15 +78,15 @@ def run_comparison(
 
     for r in range(n_replicates):
         rep_seed = base_seed + r
-        print(f"--- Replicate {r} (seed={rep_seed}) ---")
+        logging.info(f"--- Replicate {r} (seed={rep_seed}) ---")
         for sname, acq_fn in strategies.items():
-            print(f"=== Running strategy: {acq_fn.name} ===")
+            logging.info(f"=== Running strategy: {acq_fn.name} ===")
             state = run_al_loop(
                 X_pool, Y_pool, acq_fn, config, seed=rep_seed
             )
             results[sname].hv_histories.append(state.hv_history)
             results[sname].states.append(state)
-            print()
+
 
     return results
 
@@ -88,7 +121,7 @@ def plot_hv_convergence(
 
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved HV convergence plot -> {save_path}")
+        logging.info(f"Saved HV convergence plot -> {save_path}")
     plt.close(fig)
 
 
@@ -151,7 +184,7 @@ def plot_pareto_snapshots(
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved Pareto snapshots -> {save_path}")
+        logging.info(f"Saved Pareto snapshots -> {save_path}")
     plt.close(fig)
 
 
@@ -211,7 +244,7 @@ def plot_iteration_selections(
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved iteration selections plot -> {save_path}")
+        logging.info(f"Saved iteration selections plot -> {save_path}")
     plt.close(fig)
 
 
@@ -260,7 +293,7 @@ def plot_acq_timing(
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved acquisition timing plot -> {save_path}")
+        logging.info(f"Saved acquisition timing plot -> {save_path}")
     plt.close(fig)
 
 
@@ -320,7 +353,7 @@ def plot_validation_metrics(
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved validation metrics plot -> {save_path}")
+        logging.info(f"Saved validation metrics plot -> {save_path}")
     plt.close(fig)
 
 
@@ -464,7 +497,7 @@ def plot_al_diagnostics(
     fig.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150)
-        print(f"Saved AL diagnostics -> {save_path}")
+        logging.info(f"Saved AL diagnostics -> {save_path}")
     plt.close(fig)
 
 
@@ -505,7 +538,7 @@ def save_hv_csv(
                                 row[f"{prefix}_{key}_{obj}"] = float("nan")
                 rows.append(row)
     pd.DataFrame(rows).to_csv(save_path, index=False)
-    print(f"Saved HV data -> {save_path}")
+    logging.info(f"Saved HV data -> {save_path}")
 
 
 def main() -> None:
@@ -558,6 +591,9 @@ def main() -> None:
                         action="store_true",
                         help="Negate both objective columns (use if objectives are to be minimized)")
     args = parser.parse_args()
+    
+    logger = setup_logging(args.output_dir)
+    logger.info("Starting PAL comparison")
 
     config = ExperimentConfig()
     config.data.n_compounds = args.n_compounds
@@ -585,7 +621,7 @@ def main() -> None:
     if args.data_file is not None:
         if args.property_cols is None:
             parser.error("--property_cols required when --data_file is provided")
-        print(f"Loading dataset from {args.data_file} ...")
+        logging.info(f"Loading dataset from {args.data_file} ...")
         df, X_precomputed = load_dataset_from_file(
             args.data_file,
             args.property_cols,
@@ -594,7 +630,7 @@ def main() -> None:
         )
         Y_pool = df[args.property_cols].values.astype(np.float32)
         if args.negate_objectives:
-            print("Negating objectives (converting minimization -> maximization)")
+            logging.info("Negating objectives (converting minimization -> maximization)")
             Y_pool = -Y_pool
         config.obj_names = tuple(args.property_cols)
         if X_precomputed is not None:
@@ -603,13 +639,13 @@ def main() -> None:
         else:
             smiles = df[args.smiles_col].tolist()
             if args.lazy_fingerprints:
-                print("Using lazy ECFP fingerprints (computed on demand) ...")
+                logging.info("Using lazy ECFP fingerprints (computed on demand) ...")
                 X_pool = LazyECFP(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
             else:
-                print("Computing ECFP fingerprints ...")
+                logging.info("Computing ECFP fingerprints ...")
                 X_pool = compute_ecfp(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
     else:
-        print("Generating ZINC dataset ...")
+        logging.info("Generating ZINC dataset ...")
         df = generate_zinc_dataset(
             n_compounds=config.data.n_compounds, seed=config.data.seed
         )
@@ -617,14 +653,14 @@ def main() -> None:
         config.obj_names = ("SA score (10 - raw)", "QED")
         smiles = df["smiles"].tolist()
         if args.lazy_fingerprints:
-            print("Using lazy ECFP fingerprints (computed on demand) ...")
+            logging.info("Using lazy ECFP fingerprints (computed on demand) ...")
             X_pool = LazyECFP(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
         else:
-            print("Computing ECFP fingerprints ...")
+            logging.info("Computing ECFP fingerprints ...")
             X_pool = compute_ecfp(smiles, radius=config.ecfp_radius, n_bits=config.ecfp_nbits)
 
     oracle_hv = hypervolume_2d(Y_pool, config.al.ref_point)
-    print(f"Oracle HV = {oracle_hv:.4f}  (pool size = {len(Y_pool)})\n")
+    logging.info(f"Oracle HV = {oracle_hv:.4f}  (pool size = {len(Y_pool)})\n")
 
     acq_kwargs = {
         "ucb": {"k_ucb": args.k_ucb},
@@ -684,7 +720,7 @@ def main() -> None:
 
     # --- Acquisition explanation visualizations ---
     if args.visualize_acq:
-        print("\nGenerating acquisition explanation plots ...")
+        logging.info("\nGenerating acquisition explanation plots ...")
         # Pick the median replicate from the ellipse strategy
         ell_res = results["ellipse"]
         state = _pick_median_replicate(ell_res)
@@ -724,7 +760,7 @@ def main() -> None:
             k=args.k_ucb,
         )
 
-    print("\nDone!")
+    logging.info("\nDone!")
 
 
 if __name__ == "__main__":
