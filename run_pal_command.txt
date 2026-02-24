@@ -8,4 +8,5 @@ nohup python -u -m pal.compare \
   --n_iterations 20 \
   --n_replicates 3 \
   --negate_objectives \
+  --device cuda \
   > pal_results_log.log 2>&1 &
