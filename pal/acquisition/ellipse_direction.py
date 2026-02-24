@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Tuple, Optional
 import numpy as np
 
@@ -6,19 +7,6 @@ from .base import AcquisitionFunction
 
 
 class EllipseDirectionAcquisition(AcquisitionFunction):
-    """
-    Directional ellipse (your old ellipsoid logic, but inside PAL):
-
-    - Build Pareto front from current_labels.
-    - penalties(w) = max_{p in front} w^T p
-    - For each candidate i and direction w:
-        x*(i,w) = mu_i + k * (Sigma_i w) / sqrt(w^T Sigma_i w)
-        alpha(i,w) = w^T x*(i,w) - penalties(w)
-      score(i) = max_w alpha(i,w)
-
-    Uses full covs if provided; otherwise falls back to diagonal from stds.
-    """
-
     def __init__(
         self,
         k: float = 2.0,
@@ -28,7 +16,6 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         self.k = float(k)
         self.eps = float(eps)
 
-        # 22 directions exactly like you gave
         if w_directions is None:
             w_directions = np.column_stack([
                 np.linspace(1.0, 0.0, 22),
@@ -37,7 +24,6 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
 
         self.W = np.asarray(w_directions, dtype=np.float32)
         assert self.W.ndim == 2 and self.W.shape[1] == 2, "w_directions must be (W,2)"
-
         self.last_w_idx_max: Optional[np.ndarray] = None
 
     @property
@@ -55,20 +41,21 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
     ) -> np.ndarray:
         means = np.asarray(means, dtype=np.float32)
         stds = np.asarray(stds, dtype=np.float32)
+        W = self.W  # (W,2)
 
-        # --- Pareto + penalties exactly like your torch code ---
+        # Pareto front (must stay)
         front = pareto_front_2d(np.asarray(current_labels, dtype=np.float32))  # (M',2)
 
         # penalties(w) = max_p w^T p
-        # if front empty (edge case), penalties=0
         if front.shape[0] == 0:
-            penalties = np.zeros((self.W.shape[0],), dtype=np.float32)
+            penalties = np.zeros((W.shape[0],), dtype=np.float32)
         else:
-            penalties = (front @ self.W.T).max(axis=0).astype(np.float32)  # (W,)
+            penalties = (front @ W.T).max(axis=0).astype(np.float32)  # (W,)
 
         N = means.shape[0]
+        nW = W.shape[0]
 
-        # --- covariance per candidate ---
+        # Build covs if missing
         if covs is None:
             covs_use = np.zeros((N, 2, 2), dtype=np.float32)
             covs_use[:, 0, 0] = stds[:, 0] ** 2
@@ -76,29 +63,24 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         else:
             covs_use = np.asarray(covs, dtype=np.float32)
 
-        scores = np.full((N,), -np.inf, dtype=np.float32)
-        best_w = np.zeros((N,), dtype=np.int32)
+        # v(i,w) = Σ_i w  -> shape (N,W,2)
+        # einsum: (N,2,2) x (W,2) -> (N,W,2)
+        v = np.einsum("nij,wj->nwi", covs_use, W)  # (N,W,2)
 
-        # loop over 22 directions
-        for wi in range(self.W.shape[0]):
-            w = self.W[wi]  # (2,)
+        # denom2(i,w) = w^T Σ_i w = sum_j w_j * v_j
+        denom2 = np.einsum("nwi,wi->nw", v, W)     # (N,W)
+        denom = np.sqrt(np.clip(denom2, self.eps, None)).astype(np.float32)  # (N,W)
 
-            # denom(i)=sqrt(w^T Σ_i w)
-            denom2 = np.einsum("iab,a,b->i", covs_use, w, w)
-            denom = np.sqrt(np.clip(denom2, self.eps, None))
+        # pts(i,w,2) = mu_i + k * v(i,w)/denom(i,w)
+        pts = means[:, None, :] + self.k * (v / denom[:, :, None])  # (N,W,2)
 
-            # v(i)=Σ_i w
-            v = np.einsum("iab,b->ia", covs_use, w)
+        # alpha(i,w) = w^T pts(i,w) - penalties(w)
+        proj = np.einsum("nwi,wi->nw", pts, W)  # (N,W)
+        alpha = proj - penalties[None, :]       # (N,W)
 
-            # boundary point in direction w
-            pts = means + self.k * (v / denom[:, None])  # (N,2)
-
-            # project boundary point onto w, subtract baseline penalty(w)
-            alpha = (pts @ w) - penalties[wi]  # (N,)
-
-            mask = alpha > scores
-            scores[mask] = alpha[mask]
-            best_w[mask] = wi
+        # score(i) = max_w alpha(i,w)
+        best_w = np.argmax(alpha, axis=1).astype(np.int32)          # (N,)
+        scores = alpha[np.arange(N), best_w].astype(np.float32)     # (N,)
 
         self.last_w_idx_max = best_w
         return scores
