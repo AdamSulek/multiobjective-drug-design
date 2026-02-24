@@ -1,13 +1,11 @@
 nohup python -u -m pal.compare \
-    --data_file data/savi_combined_pareto.parquet \
-    --property_cols score_3GVB score_6D6P \
-    --fingerprint_col X_ecfp_2 \
-    --strategies exploitation ucb random ellipse ellipse_fast ellipse_directions \
-    --seed_size 100 \
-    --batch_size 100 \
-    --n_iterations 20 \
-    --n_replicates 3 \
-    --negate_objectives \ 
-    > pal_results_log.log 2>&1 &
-
-#zmiana znaku dla docking score
+  --data_file data/savi_combined_pareto.parquet \
+  --property_cols score_3GVB score_6D6P \
+  --fingerprint_col X_ecfp_2 \
+  --strategies exploitation ucb random ellipse ellipse_fast ellipse_directions \
+  --seed_size 100 \
+  --batch_size 100 \
+  --n_iterations 20 \
+  --n_replicates 3 \
+  --negate_objectives \
+  > pal_results_log.log 2>&1 &
