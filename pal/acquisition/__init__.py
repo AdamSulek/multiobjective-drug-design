@@ -6,6 +6,8 @@ from .ellipse_fast import FastEllipseAcquisition
 from .exploitation import ExploitationAcquisition
 from .random import RandomAcquisition
 from .ucb import UCBExplorationAcquisition
+from .ellipse_direction import EllipseDirectionAcquisition
+
 
 REGISTRY: dict[str, type[AcquisitionFunction]] = {
     "exploitation": ExploitationAcquisition,
@@ -13,6 +15,7 @@ REGISTRY: dict[str, type[AcquisitionFunction]] = {
     "random": RandomAcquisition,
     "ellipse": EllipseAcquisition,
     "ellipse_fast": FastEllipseAcquisition,
+    "ellipse_directions": EllipseDirectionAcquisition,
 }
 
 

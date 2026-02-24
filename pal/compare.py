@@ -20,7 +20,6 @@ from .model import build_model, mc_predict, predict_eval, train_model
 from .pareto import build_stair_polygon, hypervolume_2d, pareto_front_2d
 from .visualize import generate_acquisition_explanations
 
-
 @dataclass
 class StrategyResult:
     name: str
@@ -538,7 +537,7 @@ def main() -> None:
                         help="Generate explanatory acquisition visualizations")
     parser.add_argument(
         "--strategies", type=str, nargs="+",
-        default=["exploitation", "ucb", "random", "ellipse_fast"],
+        default=["exploitation", "ucb", "random", "ellipse_fast", "ellipse_directions"],
         help="Acquisition functions to compare. "
              "Available: exploitation, ucb, random, ellipse, ellipse_fast"
     )
@@ -625,7 +624,9 @@ def main() -> None:
         "ucb": {"k_ucb": args.k_ucb},
         "ellipse": {"k": args.k_ucb},
         "ellipse_fast": {"k": args.k_ucb},
+        "ellipse_directions": {"k": args.k_ucb},  # <-- DODAJ
     }
+    
     strategies = {
         name: get_acquisition(name, **acq_kwargs.get(name, {}))
         for name in args.strategies
