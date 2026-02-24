@@ -554,6 +554,9 @@ def main() -> None:
     parser.add_argument("--lazy-fingerprints", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Compute ECFP fingerprints lazily on demand (default: on)")
+    parser.add_argument("--negate_objectives",
+                        action="store_true",
+                        help="Negate both objective columns (use if objectives are to be minimized)")
     args = parser.parse_args()
 
     config = ExperimentConfig()
@@ -590,6 +593,9 @@ def main() -> None:
             fingerprint_col=args.fingerprint_col,
         )
         Y_pool = df[args.property_cols].values.astype(np.float32)
+        if args.negate_objectives:
+            print("Negating objectives (converting minimization -> maximization)")
+            Y_pool = -Y_pool
         config.obj_names = tuple(args.property_cols)
         if X_precomputed is not None:
             X_pool = X_precomputed
@@ -723,3 +729,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
