@@ -1,5 +1,5 @@
 nohup python -u -m pal.compare \
-  --data_file data/savi_combined_pareto.parquet \
+  --data_file data/savi_combined_pareto_with_smiles.parquet \
   --property_cols score_3GVB score_6D6P \
   --fingerprint_col X_ecfp_2 \
   --strategies random ucb ellipse_fast ellipse_directions \
