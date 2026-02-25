@@ -1,5 +1,6 @@
 """Run multiple acquisition strategies and plot convergence (CLI entry)."""
 
+from __future__ import annotations
 import argparse
 from asyncio.log import logger
 import os
@@ -22,6 +23,66 @@ from .pareto import build_stair_polygon, hypervolume_2d, pareto_front_2d
 from .visualize import generate_acquisition_explanations
 import logging
 import sys
+import re
+
+
+def save_iteration_selections(
+    results: Dict[str, StrategyResult],
+    df: pd.DataFrame,
+    config: ExperimentConfig,
+    output_dir: str,
+    id_col: str,
+    smiles_col: str = "smiles",
+) -> None:
+    """Save selected compounds per iteration for each strategy/replicate.
+
+    Writes one parquet per strategy_key in <output_dir>/selections/, e.g.:
+      ucb_k2_selections.parquet
+      ellipse_fast_k3_selections.parquet
+      random_selections.parquet
+
+    Columns:
+      strategy, strategy_key, k, replicate, iteration, pool_index, mol_id, smiles
+    """
+    out_dir = Path(output_dir) / "selections"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if id_col not in df.columns:
+        raise KeyError(f"id_col='{id_col}' not in df.columns")
+
+    mol_ids = df[id_col].to_numpy()
+    smiles = df[smiles_col].to_numpy() if smiles_col in df.columns else None
+
+    def _extract_k(strategy_key: str) -> float:
+        # zwraca float (NaN jeśli brak), żeby ładnie weszło do Parquet/pandas
+        m = re.search(r"_k(\d+)$", strategy_key)
+        return float(m.group(1)) if m else float("nan")
+
+    for strategy_key, res in results.items():
+        k_val = _extract_k(strategy_key)
+
+        rows = []
+        for r, state in enumerate(res.states):
+            for it, sel_pool in enumerate(state.selections_per_iter):
+                for pool_idx in sel_pool:
+                    row = {
+                        "strategy": res.name,            # ładna nazwa do wykresów
+                        "strategy_key": strategy_key,    # np. ucb_k2 / random
+                        "k": k_val,                      # 0..4 albo NaN dla random
+                        "replicate": r,
+                        "iteration": it,                 # 0 = seed
+                        "pool_index": int(pool_idx),
+                        "mol_id": mol_ids[pool_idx],
+                    }
+                    if smiles is not None:
+                        row["smiles"] = smiles[pool_idx]
+                    rows.append(row)
+
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", strategy_key)
+        out_path = out_dir / f"{safe_key}_selections.parquet"
+        pd.DataFrame(rows).to_parquet(out_path, index=False)
+        logging.info(f"Saved iteration selections -> {out_path}")
+        
 
 def setup_logging(output_dir: str) -> logging.Logger:
     logger = logging.getLogger("pal")
@@ -547,7 +608,7 @@ def main() -> None:
     parser.add_argument("--n_iterations", type=int, default=50)
     parser.add_argument("--seed_size", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=10)
-    parser.add_argument("--k_ucb", type=float, default=2.0)
+    #parser.add_argument("--k_ucb", type=float, default=2.0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--mc_passes", type=int, default=50)
     parser.add_argument("--n_replicates", type=int, default=3)
@@ -590,6 +651,10 @@ def main() -> None:
     parser.add_argument("--negate_objectives",
                         action="store_true",
                         help="Negate both objective columns (use if objectives are to be minimized)")
+    parser.add_argument("--k_list", type=int, nargs="+", default=[1, 2, 3, 4],
+                    help="List of k values for UCB/ellipse strategies.")
+    parser.add_argument("--ucb_include_k0", action="store_true",
+                        help="Also run UCB with k=0 (pure exploitation).")
     args = parser.parse_args()
     
     logger = setup_logging(args.output_dir)
@@ -628,6 +693,7 @@ def main() -> None:
             smiles_col=args.smiles_col if not args.fingerprint_col else None,
             fingerprint_col=args.fingerprint_col,
         )
+        df = df.drop_duplicates(subset="ID").reset_index(drop=True)
         Y_pool = df[args.property_cols].values.astype(np.float32)
         if args.negate_objectives:
             logging.info("Negating objectives (converting minimization -> maximization)")
@@ -662,19 +728,38 @@ def main() -> None:
     oracle_hv = hypervolume_2d(Y_pool, config.al.ref_point)
     logging.info(f"Oracle HV = {oracle_hv:.4f}  (pool size = {len(Y_pool)})\n")
 
-    acq_kwargs = {
-        "ucb": {"k_ucb": args.k_ucb},
-        "ellipse": {"k": args.k_ucb},
-        "ellipse_fast": {"k": args.k_ucb},
-        "ellipse_directions": {"k": args.k_ucb},  # <-- DODAJ
-    }
-    
-    strategies = {
-        name: get_acquisition(name, **acq_kwargs.get(name, {}))
-        for name in args.strategies
-    }
+    strategies = {}
+
+    # random
+    if "random" in args.strategies:
+        strategies["random"] = get_acquisition("random")
+
+    # UCB
+    if "ucb" in args.strategies:
+        ucb_ks = ([0] if args.ucb_include_k0 else []) + list(args.k_list)
+        for k in ucb_ks:
+            strategies[f"ucb_k{k}"] = get_acquisition("ucb", k_ucb=float(k))
+
+    # ellipse_fast
+    if "ellipse_fast" in args.strategies:
+        for k in args.k_list:
+            strategies[f"ellipse_fast_k{k}"] = get_acquisition("ellipse_fast", k=float(k))
+
+    # ellipse_directions
+    if "ellipse_directions" in args.strategies:
+        for k in args.k_list:
+            strategies[f"ellipse_directions_k{k}"] = get_acquisition("ellipse_directions", k=float(k))
 
     results = run_comparison(strategies, X_pool, Y_pool, config)
+    
+    save_iteration_selections(
+        results=results,
+        df=df,
+        config=config,
+        output_dir=args.output_dir,
+        id_col="ID",          # <- zmień na swoją kolumnę ID
+        smiles_col=args.smiles_col,
+    )
 
     plot_hv_convergence(
         results,
