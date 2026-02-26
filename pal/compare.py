@@ -47,9 +47,11 @@ def load_seed_indices(path: str) -> np.ndarray:
     return arr
 
 
-def seed_everything(seed: int, deterministic_torch: bool = True) -> None:
-    """Best-effort reproducibility across runs/machines."""
+def seed_everything(seed: int) -> None:
+    import os
     import random
+    import numpy as np
+
     os.environ["PYTHONHASHSEED"] = str(seed)
 
     random.seed(seed)
@@ -57,19 +59,18 @@ def seed_everything(seed: int, deterministic_torch: bool = True) -> None:
 
     try:
         import torch
+
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-        if deterministic_torch:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-            # może rzucać wyjątek, jeśli jakaś operacja nie ma deterministycznej wersji
-            try:
-                torch.use_deterministic_algorithms(True)
-            except Exception:
-                pass
+        # Zostawiamy stabilniejsze ustawienia CuDNN
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        # ❌ NIE wymuszamy strict deterministic (to powodowało crash na CuBLAS)
+        # torch.use_deterministic_algorithms(True)
+
     except Exception:
-        # jeśli torch nie jest zainstalowany / nieużywany
         pass
     
 
