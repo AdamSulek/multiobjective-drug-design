@@ -1,0 +1,14 @@
+nohup python -u -m pal.compare \
+  --data_file data/savi_combined_pareto_with_smiles.parquet \
+  --property_cols score_3GVB score_6D6P \
+  --fingerprint_col X_ecfp_2 \
+  --strategies random ucb ellipse_fast ellipse_directions \
+  --k_list 1 2 3 4 \
+  --ucb_include_k0 \
+  --seed_size 100 \
+  --batch_size 100 \
+  --n_iterations 20 \
+  --n_replicates 3 \
+  --negate_objectives \
+  --device cuda \
+  > pal_batch_100_seed_100.log 2>&1 &
