@@ -6,7 +6,7 @@ from asyncio.log import logger
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,6 +25,53 @@ import logging
 import sys
 import re
 
+
+def load_seed_indices(path: str) -> np.ndarray:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Seed indices file not found: {path}")
+
+    if p.suffix.lower() == ".npy":
+        arr = np.load(p)
+        arr = np.array(arr, dtype=int).ravel()
+        return arr
+
+    # tekst: liczby rozdzielone nową linią / spacją / przecinkiem
+    text = p.read_text().strip()
+    if not text:
+        raise ValueError(f"Empty seed indices file: {path}")
+
+    # zamień przecinki na spacje i split
+    tokens = text.replace(",", " ").split()
+    arr = np.array([int(t) for t in tokens], dtype=int).ravel()
+    return arr
+
+
+def seed_everything(seed: int, deterministic_torch: bool = True) -> None:
+    """Best-effort reproducibility across runs/machines."""
+    import random
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+        if deterministic_torch:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            # może rzucać wyjątek, jeśli jakaś operacja nie ma deterministycznej wersji
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
+    except Exception:
+        # jeśli torch nie jest zainstalowany / nieużywany
+        pass
+    
 
 def save_iteration_selections(
     results: Dict[str, StrategyResult],
@@ -126,11 +173,19 @@ def run_comparison(
     X_pool: np.ndarray,
     Y_pool: np.ndarray,
     config: ExperimentConfig,
+    seed_indices_files: List[str] | None = None,   
 ) -> Dict[str, StrategyResult]:
     """Run each strategy with multiple replicates on pre-computed pool data."""
     base_seed = config.data.seed
     n_replicates = config.al.n_replicates
 
+    if seed_indices_files is not None:
+        if len(seed_indices_files) != n_replicates:
+            raise ValueError(
+                f"--seed_indices_files must have exactly n_replicates={n_replicates} paths, "
+                f"got {len(seed_indices_files)}"
+            )
+    
     results: Dict[str, StrategyResult] = {}
     for sname, acq_fn in strategies.items():
         results[sname] = StrategyResult(
@@ -139,11 +194,31 @@ def run_comparison(
 
     for r in range(n_replicates):
         rep_seed = base_seed + r
+        
+        seed_indices = None
+        if seed_indices_files is not None:
+            seed_indices = load_seed_indices(seed_indices_files[r])
+
+            # walidacja długości i zakresu
+            if len(seed_indices) != config.al.seed_size:
+                raise ValueError(
+                    f"Seed indices in {seed_indices_files[r]} have length {len(seed_indices)}, "
+                    f"expected seed_size={config.al.seed_size}"
+                )
+            if seed_indices.min() < 0 or seed_indices.max() >= len(Y_pool):
+                raise ValueError(
+                    f"Seed indices in {seed_indices_files[r]} out of range "
+                    f"[0, {len(Y_pool)-1}]"
+                )
+            if len(np.unique(seed_indices)) != len(seed_indices):
+                raise ValueError(f"Seed indices in {seed_indices_files[r]} contain duplicates")
+            
         logging.info(f"--- Replicate {r} (seed={rep_seed}) ---")
         for sname, acq_fn in strategies.items():
             logging.info(f"=== Running strategy: {acq_fn.name} ===")
             state = run_al_loop(
-                X_pool, Y_pool, acq_fn, config, seed=rep_seed
+                X_pool, Y_pool, acq_fn, config, seed=rep_seed,
+                seed_indices=seed_indices,   
             )
             results[sname].hv_histories.append(state.hv_history)
             results[sname].states.append(state)
@@ -608,7 +683,10 @@ def main() -> None:
     parser.add_argument("--n_iterations", type=int, default=50)
     parser.add_argument("--seed_size", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=10)
-    #parser.add_argument("--k_ucb", type=float, default=2.0)
+    parser.add_argument("--seed_indices_files", type=str, nargs="*",
+           default=None, help=("Optional list of files with initial seed indices (one file per replicate). "
+            "Each file can be .npy (numpy array) or a text file with integers (one per line "
+            "or comma/space separated). If provided, overrides random seed selection."))
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--mc_passes", type=int, default=50)
     parser.add_argument("--n_replicates", type=int, default=3)
@@ -656,6 +734,8 @@ def main() -> None:
     parser.add_argument("--ucb_include_k0", action="store_true",
                         help="Also run UCB with k=0 (pure exploitation).")
     args = parser.parse_args()
+    
+    seed_everything(args.seed)
     
     logger = setup_logging(args.output_dir)
     logger.info("Starting PAL comparison")
@@ -750,7 +830,10 @@ def main() -> None:
         for k in args.k_list:
             strategies[f"ellipse_directions_k{k}"] = get_acquisition("ellipse_directions", k=float(k))
 
-    results = run_comparison(strategies, X_pool, Y_pool, config)
+    results = run_comparison(
+        strategies, X_pool, Y_pool, config,
+        seed_indices_files=args.seed_indices_files,
+    )
     
     save_iteration_selections(
         results=results,

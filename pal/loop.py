@@ -55,46 +55,67 @@ class ALState:
 
 
 def run_al_loop(
-    X_pool: np.ndarray,
-    Y_pool: np.ndarray,
-    acquisition_fn: AcquisitionFunction,
-    config: ExperimentConfig,
-    seed: int = 42,
-) -> ALState:
+    X_pool,
+    Y_pool,
+    acq_fn,
+    config,
+    seed: int,
+    seed_indices: np.ndarray | None = None,
+):
     """Run a full active-learning loop.
 
     Parameters
     ----------
-    X_pool : np.ndarray, shape ``(N, D)``
-        Precomputed fingerprints for the entire pool.
-    Y_pool : np.ndarray, shape ``(N, 2)``
+    X_pool : np.ndarray or LazyECFP-like, shape (N, D)
+        Features for the entire pool.
+    Y_pool : np.ndarray, shape (N, 2)
         Ground-truth objective values (oracle look-up table).
-    acquisition_fn : AcquisitionFunction
+    acq_fn : AcquisitionFunction
         Strategy used to select the next batch.
     config : ExperimentConfig
         Full experiment configuration.
     seed : int
-        Random seed for the initial labeled set.
+        Random seed for the initial labeled set (and any internal randomness if used).
+    seed_indices : np.ndarray | None
+        Optional explicit initial labeled indices (length = seed_size).
 
     Returns
     -------
     ALState
         Final state including HV history.
     """
-    rng = np.random.RandomState(seed)
-    N = len(X_pool)
+    import time  # upewnij się, że masz; możesz też przenieść do importów na górze pliku
+
+    N = len(Y_pool)
     al = config.al
     mcfg = config.model
 
-    # --- seed the labeled set ---
-    all_idx = np.arange(N)
-    rng.shuffle(all_idx)
-    labeled = list(all_idx[: al.seed_size])
-    unlabeled = list(all_idx[al.seed_size :])
+    rng = np.random.default_rng(seed)
 
+    # --- choose initial labeled set (seed) ---
+    if seed_indices is None:
+        labeled = rng.choice(N, size=al.seed_size, replace=False).astype(int).tolist()
+    else:
+        labeled_arr = np.array(seed_indices, dtype=int).ravel()
+
+        if len(labeled_arr) != al.seed_size:
+            raise ValueError(
+                f"seed_indices length={len(labeled_arr)} but seed_size={al.seed_size}"
+            )
+        if labeled_arr.min() < 0 or labeled_arr.max() >= N:
+            raise ValueError(f"seed_indices out of range [0, {N-1}]")
+        if len(np.unique(labeled_arr)) != len(labeled_arr):
+            raise ValueError("seed_indices contain duplicates")
+
+        labeled = labeled_arr.tolist()
+
+    labeled_set = set(labeled)
+    unlabeled = [i for i in range(N) if i not in labeled_set]
+
+    # --- init state ---
     state = ALState(
-        labeled_indices=labeled,
-        unlabeled_indices=unlabeled,
+        labeled_indices=list(labeled),
+        unlabeled_indices=list(unlabeled),
         Y_labeled=Y_pool[labeled].copy(),
     )
 
@@ -102,29 +123,30 @@ def run_al_loop(
     state.selections_per_iter.append(list(labeled))
 
     # initial HV
-    hv = hypervolume_2d(state.Y_labeled, al.ref_point)
-    state.hv_history.append(hv)
+    hv0 = hypervolume_2d(state.Y_labeled, al.ref_point)
+    state.hv_history.append(hv0)
     state.acq_time_per_iter.append(0.0)  # no acquisition at seed
     state.train_metrics.append(_nan_metrics())
     state.val_metrics.append(_nan_metrics())
     state.sel_metrics.append(_nan_metrics())
+
     print(
-        f"[{acquisition_fn.name}] seed  | "
-        f"labeled={len(state.labeled_indices):4d}  HV={hv:.4f}  acq_time=0.000s"
+        f"[{acq_fn.name}] seed  | "
+        f"labeled={len(state.labeled_indices):4d}  HV={hv0:.4f}  acq_time=0.000s"
     )
 
+    # --- main loop ---
     for it in range(1, al.n_iterations + 1):
         state.iteration = it
 
-        # 1. train model from scratch (on normalized targets)
+        # 1) train model from scratch on labeled set (normalize targets)
         model = build_model(mcfg, device=config.device)
-        if hasattr(X_pool, 'precompute'):
-            X_pool.precompute(state.labeled_indices)
+
         X_train = X_pool[state.labeled_indices]
         Y_train = state.Y_labeled
 
-        Y_mean = Y_train.mean(axis=0)  # (2,)
-        Y_std = np.maximum(Y_train.std(axis=0), 1e-8)  # (2,)
+        Y_mean = Y_train.mean(axis=0)
+        Y_std = np.maximum(Y_train.std(axis=0), 1e-8)
         Y_train_norm = (Y_train - Y_mean) / Y_std
 
         train_model(
@@ -143,13 +165,13 @@ def run_al_loop(
             lr_scheduler_factor=mcfg.lr_scheduler_factor,
         )
 
-        # training-set regression metrics (denormalize predictions)
+        # training metrics (denormalize predictions)
         Y_train_pred = predict_eval(model, X_train, device=config.device)
         Y_train_pred = Y_train_pred * Y_std + Y_mean
         train_m = compute_regression_metrics(Y_train, Y_train_pred)
         state.train_metrics.append(train_m)
 
-        # 2. MC-dropout prediction on unlabeled pool (denormalize)
+        # 2) MC-dropout predictions on unlabeled pool (denormalize)
         X_unlabeled = X_pool[state.unlabeled_indices]
         means, stds, covs = mc_predict(
             model,
@@ -161,36 +183,38 @@ def run_al_loop(
         stds = stds * Y_std
         covs = covs * np.outer(Y_std, Y_std)[None, :, :]
 
-        # 3. acquisition: select batch
+        # 3) acquisition: select next batch (indices local to unlabeled list)
         t0 = time.perf_counter()
-        sel_local = acquisition_fn.select(
+        sel_local = acq_fn.select(
             means, stds, state.Y_labeled, al.ref_point, k=al.batch_size, covs=covs
         )
         acq_elapsed = time.perf_counter() - t0
         state.acq_time_per_iter.append(acq_elapsed)
-        # map local indices back to pool indices
+
+        # map local -> pool indices
         sel_pool = [state.unlabeled_indices[i] for i in sel_local]
+        state.selections_per_iter.append(list(sel_pool))
 
-        # record selected pool indices for this iteration
-        state.selections_per_iter.append(sel_pool)
-
-        # 4. "label" — look up ground truth
+        # 4) "label" — oracle lookup
         new_labels = Y_pool[sel_pool]
 
-        # selected-compounds metrics (MC means vs ground truth)
+        # selected-compounds metrics (MC means vs GT for selected points)
         sel_m = compute_regression_metrics(new_labels, means[sel_local])
         state.sel_metrics.append(sel_m)
 
+        # snapshot of current unlabeled pool for validation metrics
         unlabeled_snapshot = list(state.unlabeled_indices)
 
-        # 5. update state
+        # 5) update labeled/unlabeled sets
+        sel_pool_set = set(sel_pool)
+
         state.labeled_indices.extend(sel_pool)
         state.Y_labeled = np.vstack([state.Y_labeled, new_labels])
-        state.unlabeled_indices = [
-            i for i in state.unlabeled_indices if i not in set(sel_pool)
-        ]
 
-        # 6. validation: MC predictions on unlabeled pool vs ground truth
+        # keep order, remove selected efficiently
+        state.unlabeled_indices = [i for i in state.unlabeled_indices if i not in sel_pool_set]
+
+        # 6) validation metrics (on full unlabeled snapshot) every val_every
         if it % al.val_every == 0:
             Y_unlabeled_true = Y_pool[unlabeled_snapshot]
             val_m = compute_regression_metrics(Y_unlabeled_true, means)
@@ -198,7 +222,7 @@ def run_al_loop(
             val_m = _nan_metrics()
         state.val_metrics.append(val_m)
 
-        # 7. compute HV
+        # 7) hypervolume
         hv = hypervolume_2d(state.Y_labeled, al.ref_point)
         state.hv_history.append(hv)
 
@@ -206,11 +230,11 @@ def run_al_loop(
         tmse = f"[{train_m['mse'][0]:.4f},{train_m['mse'][1]:.4f}]"
         tr2 = f"[{train_m['r2'][0]:.2f},{train_m['r2'][1]:.2f}]"
         line = (
-            f"[{acquisition_fn.name}] it {it:3d} | "
+            f"[{acq_fn.name}] it {it:3d} | "
             f"labeled={len(state.labeled_indices):4d}  HV={hv:.4f}  acq={acq_elapsed:.3f}s"
             f"  train_MSE={tmse} R2={tr2}"
         )
-        if not np.isnan(val_m['mse'][0]):
+        if not np.isnan(val_m["mse"][0]):
             vmse = f"[{val_m['mse'][0]:.4f},{val_m['mse'][1]:.4f}]"
             vr2 = f"[{val_m['r2'][0]:.2f},{val_m['r2'][1]:.2f}]"
             line += f"  val_MSE={vmse} R2={vr2}"
