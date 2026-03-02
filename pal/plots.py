@@ -10,7 +10,7 @@ import numpy as np
 from .pipeline import StrategyResult
 from .pareto import pareto_front_2d, build_stair_polygon  # still 2D for now
 
-
+import os
 # -------------------------------------------------
 # Utilities
 # -------------------------------------------------
