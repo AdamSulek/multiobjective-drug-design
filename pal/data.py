@@ -82,7 +82,7 @@ def load_dataset_from_file(
     path : str
         Path to CSV or parquet file.
     property_cols : list[str]
-        Exactly 2 column names for the objectives.
+        2 or 3 column names for the objectives.
     smiles_col : str or None
         Column containing SMILES strings (caller computes ECFP).
     fingerprint_col : str or None
@@ -92,9 +92,9 @@ def load_dataset_from_file(
     -------
     (df, X) where X is the precomputed fingerprint matrix or None.
     """
-    if len(property_cols) != 2:
-        raise ValueError(f"Exactly 2 property columns required, got {len(property_cols)}")
-
+    if len(property_cols) not in (2, 3):
+        raise ValueError(f"2 or 3 property columns required, got {len(property_cols)}")
+    
     ext = path.rsplit(".", 1)[-1].lower()
     if ext == "parquet":
         df = pd.read_parquet(path)

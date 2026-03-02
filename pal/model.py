@@ -1,6 +1,10 @@
-"""MLP with MC-dropout for multi-objective prediction."""
+"""MLP with MC-dropout for multi-objective prediction (dimension-agnostic)."""
+
+from __future__ import annotations
 
 import copy
+import logging
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -9,6 +13,33 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 
 from .config import ModelConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _r2_torch(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+    """Per-target R² for shape (N, d). Returns tensor (d,)."""
+    # handle constant targets safely
+    ss_res = torch.sum((y_true - y_pred) ** 2, dim=0)
+    y_mean = torch.mean(y_true, dim=0)
+    ss_tot = torch.sum((y_true - y_mean) ** 2, dim=0).clamp_min(1e-12)
+    return 1.0 - ss_res / ss_tot
+
+
+def _log_cuda_mem(prefix: str = "") -> None:
+    """Log basic CUDA allocator stats (GB). Safe to call on CPU-only machines."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / (1024**3)
+        reserv = torch.cuda.memory_reserved() / (1024**3)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024**3)
+        msg_prefix = (prefix + " ") if prefix else ""
+        # logger.info(
+        #     "%sCUDA mem: allocated=%.2fGB reserved=%.2fGB max_alloc=%.2fGB",
+        #     msg_prefix,
+        #     alloc,
+        #     reserv,
+        #     max_alloc,
+        # )
 
 
 class MLP(nn.Module):
@@ -33,7 +64,11 @@ class MLP(nn.Module):
             prev = h
 
         self.backbone = nn.Sequential(*layers)
-        self.head = nn.Linear(prev, out_features)
+        self.head = nn.Linear(prev, int(out_features))
+
+    @property
+    def out_features(self) -> int:
+        return int(self.head.out_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.backbone(x))
@@ -43,8 +78,8 @@ class MoleculeDataset(Dataset):
     """Simple dataset wrapping numpy feature and label arrays."""
 
     def __init__(self, X: np.ndarray, Y: np.ndarray):
-        self.X = torch.from_numpy(X).float()
-        self.Y = torch.from_numpy(Y).float()
+        self.X = torch.from_numpy(np.asarray(X)).float()
+        self.Y = torch.from_numpy(np.asarray(Y)).float()
 
     def __len__(self) -> int:
         return len(self.X)
@@ -53,14 +88,19 @@ class MoleculeDataset(Dataset):
         return self.X[idx], self.Y[idx]
 
 
-def build_model(cfg: ModelConfig, device: str = "cpu") -> MLP:
-    """Construct an MLP from config and move to device."""
-    return MLP(
-        in_features=cfg.in_features,
-        hidden_sizes=cfg.hidden_sizes,
-        dropout=cfg.dropout,
-        out_features=cfg.out_features,
+def build_model(cfg: ModelConfig, device: str = "cpu", out_features: int | None = None) -> MLP:
+    """Construct an MLP from config and move to device.
+
+    If out_features is provided, it overrides cfg.out_features.
+    """
+    of = int(out_features) if out_features is not None else int(getattr(cfg, "out_features", 2))
+    model = MLP(
+        in_features=int(cfg.in_features),
+        hidden_sizes=tuple(cfg.hidden_sizes),
+        dropout=float(cfg.dropout),
+        out_features=of,
     ).to(device)
+    return model
 
 
 def train_model(
@@ -84,7 +124,10 @@ def train_model(
     validation split is created and monitored for early stopping.
     Returns the best monitored loss.
     """
-    # re-initialise weights
+    X = np.asarray(X)
+    Y = np.asarray(Y)
+
+    # Re-initialise weights
     for m in model.modules():
         if isinstance(m, nn.Linear):
             nn.init.kaiming_uniform_(m.weight)
@@ -92,29 +135,33 @@ def train_model(
                 nn.init.zeros_(m.bias)
 
     n_samples = len(X)
-
-    # --- internal train/val split ---
     use_val = n_samples >= 10 and patience > 0
+
     if use_val:
-        rng = np.random.RandomState(n_samples)  # deterministic per size
+        rng = np.random.RandomState(n_samples)
         idx = np.arange(n_samples)
         rng.shuffle(idx)
+
         n_val = max(1, int(n_samples * val_fraction))
         val_idx = idx[:n_val]
         train_idx = idx[n_val:]
+
         X_tr, Y_tr = X[train_idx], Y[train_idx]
         X_val, Y_val = X[val_idx], Y[val_idx]
+
         val_ds = MoleculeDataset(X_val, Y_val)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     else:
         X_tr, Y_tr = X, Y
+        val_loader = None
+        val_ds = None
 
     ds = MoleculeDataset(X_tr, Y_tr)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(
-        optimizer, factor=lr_scheduler_factor, patience=lr_scheduler_patience,
+        optimizer, factor=lr_scheduler_factor, patience=lr_scheduler_patience
     )
     criterion = nn.MSELoss()
 
@@ -124,27 +171,38 @@ def train_model(
 
     model.train()
     for epoch in range(epochs):
-        # --- training ---
         epoch_loss = 0.0
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             pred = model(xb)
             loss = criterion(pred, yb)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * len(xb)
+
         train_loss = epoch_loss / len(ds)
 
-        # --- monitored loss ---
-        if use_val:
+        if use_val and val_loader is not None and val_ds is not None:
             model.eval()
             val_loss = 0.0
+            val_preds = []
+            val_trues = []
             with torch.no_grad():
                 for xb, yb in val_loader:
                     xb, yb = xb.to(device), yb.to(device)
-                    val_loss += criterion(model(xb), yb).item() * len(xb)
+                    pred = model(xb)
+                    val_loss += criterion(pred, yb).item() * len(xb)
+                    val_preds.append(pred)
+                    val_trues.append(yb)
+
             val_loss /= len(val_ds)
+
+            # R² per objective (d-dim)
+            val_pred_all = torch.cat(val_preds, dim=0)
+            val_true_all = torch.cat(val_trues, dim=0)
+            _ = _r2_torch(val_true_all, val_pred_all)
+
             model.train()
             monitored = val_loss
         else:
@@ -162,10 +220,18 @@ def train_model(
         if epoch >= min_epochs and patience > 0 and wait >= patience:
             break
 
-    # restore best weights
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    logger.info(
+        "Train done: n=%d use_val=%s best_loss=%.6g epochs_ran<=%d device=%s out_features=%d",
+        n_samples,
+        use_val,
+        best_loss,
+        epochs,
+        device,
+        model.out_features,
+    )
     return best_loss
 
 
@@ -176,67 +242,82 @@ def mc_predict(
     batch_size: int = 2048,
     device: str = "cpu",
     return_samples: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Run MC-dropout inference using Welford's online algorithm.
+) -> (
+    Tuple[np.ndarray, np.ndarray, np.ndarray]
+    | Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+):
+    """Run MC-dropout inference using batch-first Welford accumulation.
 
-    Parameters
-    ----------
-    model : MLP
-        Trained model (dropout layers will be kept active).
-    X : np.ndarray
-        Input features, shape ``(N, D)``.
-    n_passes : int
-        Number of stochastic forward passes.
-    batch_size : int
-        Inference batch size.
-    device : str
-        Torch device.
-    return_samples : bool
-        If True, also return the raw predictions from every MC pass
-        as an ``(N, n_passes, 2)`` array appended to the return tuple.
+    Keeps dropout active (model.train()) and computes mean/cov per batch.
+    Dimension is inferred from the model output (d = model.out_features).
 
-    Returns
-    -------
-    means : np.ndarray, shape ``(N, 2)``
-    stds  : np.ndarray, shape ``(N, 2)``
-    covs  : np.ndarray, shape ``(N, 2, 2)``
-    samples : np.ndarray, shape ``(N, n_passes, 2)``  *(only when return_samples=True)*
+    NOTE: return_samples=True can be huge: allocates (N, n_passes, d) on CPU.
     """
     model.train()  # keep dropout active
 
+    X = np.asarray(X)
     N = len(X)
-    X_t = torch.from_numpy(X).float()
+    d = int(model.out_features)
 
-    # Welford accumulators (full covariance via outer product)
-    mean = torch.zeros(N, 2)
-    m2 = torch.zeros(N, 2, 2)
+    if N == 0:
+        means = np.zeros((0, d), dtype=np.float32)
+        stds = np.zeros((0, d), dtype=np.float32)
+        covs = np.zeros((0, d, d), dtype=np.float32)
+        if return_samples:
+            samples = np.zeros((0, n_passes, d), dtype=np.float32)
+            return means, stds, covs, samples
+        return means, stds, covs
 
+    X_t = torch.from_numpy(X).float()  # CPU tensor
+
+    # Store outputs on CPU to avoid VRAM scaling with N
+    mean_out = torch.empty(N, d, dtype=torch.float32)
+    cov_out = torch.empty(N, d, d, dtype=torch.float32)
+
+    all_samples = None
     if return_samples:
-        all_samples = torch.zeros(N, n_passes, 2)
+        all_samples = torch.empty(N, n_passes, d, dtype=torch.float32)
+
+    if str(device).startswith("cuda"):
+        _log_cuda_mem("before mc_predict")
 
     with torch.no_grad():
-        for t in range(1, n_passes + 1):
-            preds = []
-            for start in range(0, N, batch_size):
-                xb = X_t[start : start + batch_size].to(device)
-                preds.append(model(xb).cpu())
-            y = torch.cat(preds, dim=0)  # (N, 2)
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            B = end - start
 
-            if return_samples:
-                all_samples[:, t - 1, :] = y
+            xb = X_t[start:end].to(device, non_blocking=True)
 
-            delta = y - mean
-            mean = mean + delta / t
-            delta2 = y - mean
-            m2 = m2 + delta.unsqueeze(-1) * delta2.unsqueeze(-2)  # (N, 2, 2)
+            mean = torch.zeros(B, d, device=device)
+            m2 = torch.zeros(B, d, d, device=device)
 
-    cov = m2 / max(n_passes - 1, 1)
-    var = torch.diagonal(cov, dim1=-2, dim2=-1)  # (N, 2)
-    std = torch.sqrt(torch.clamp(var, min=1e-9))
+            for t in range(1, n_passes + 1):
+                y = model(xb)  # (B, d)
 
-    if return_samples:
-        return mean.numpy(), std.numpy(), cov.numpy(), all_samples.numpy()
-    return mean.numpy(), std.numpy(), cov.numpy()
+                if return_samples and all_samples is not None:
+                    all_samples[start:end, t - 1, :] = y.detach().cpu()
+
+                delta = y - mean
+                mean = mean + delta / t
+                delta2 = y - mean
+                m2 = m2 + delta.unsqueeze(-1) * delta2.unsqueeze(-2)
+
+            cov = m2 / max(n_passes - 1, 1)
+
+            mean_out[start:end] = mean.detach().cpu()
+            cov_out[start:end] = cov.detach().cpu()
+
+            del xb, mean, m2, cov, delta, delta2, y
+
+    var = torch.diagonal(cov_out, dim1=-2, dim2=-1)  # (N, d)
+    std_out = torch.sqrt(torch.clamp(var, min=1e-9))
+
+    if str(device).startswith("cuda"):
+        _log_cuda_mem("after mc_predict")
+
+    if return_samples and all_samples is not None:
+        return mean_out.numpy(), std_out.numpy(), cov_out.numpy(), all_samples.numpy()
+    return mean_out.numpy(), std_out.numpy(), cov_out.numpy()
 
 
 def predict_eval(
@@ -245,29 +326,16 @@ def predict_eval(
     batch_size: int = 2048,
     device: str = "cpu",
 ) -> np.ndarray:
-    """Single deterministic forward pass with dropout disabled.
-
-    Parameters
-    ----------
-    model : MLP
-        Trained model.
-    X : np.ndarray
-        Input features, shape ``(N, D)``.
-    batch_size : int
-        Inference batch size.
-    device : str
-        Torch device.
-
-    Returns
-    -------
-    np.ndarray, shape ``(N, 2)``
-    """
+    """Single deterministic forward pass with dropout disabled."""
     model.eval()
+    X = np.asarray(X)
     X_t = torch.from_numpy(X).float()
     preds = []
+
     with torch.no_grad():
         for start in range(0, len(X_t), batch_size):
-            xb = X_t[start : start + batch_size].to(device)
+            xb = X_t[start : start + batch_size].to(device, non_blocking=True)
             preds.append(model(xb).cpu())
+
     model.train()
     return torch.cat(preds, dim=0).numpy()

@@ -56,7 +56,6 @@ class LazyECFP:
         self._smiles = smiles_list
         self._radius = radius
         self._n_bits = n_bits
-        self._cache: dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self._smiles)
@@ -65,41 +64,6 @@ class LazyECFP:
     def shape(self) -> tuple[int, int]:
         return (len(self._smiles), self._n_bits)
 
-    def precompute(self, indices) -> None:
-        """Cache fingerprints for the given pool indices.
-
-        Only uncached indices are computed; already-cached ones are skipped.
-        """
-        uncached = [i for i in indices if i not in self._cache]
-        if not uncached:
-            return
-        smiles = [self._smiles[i] for i in uncached]
-        fps = compute_ecfp(smiles, radius=self._radius, n_bits=self._n_bits)
-        for idx, row in zip(uncached, fps):
-            self._cache[idx] = row
-
     def __getitem__(self, indices) -> np.ndarray:
-        # Split into cached and uncached
-        cached_positions = []
-        uncached_positions = []
-        uncached_smiles = []
-        for pos, idx in enumerate(indices):
-            if idx in self._cache:
-                cached_positions.append(pos)
-            else:
-                uncached_positions.append(pos)
-                uncached_smiles.append(self._smiles[idx])
-
-        out = np.empty((len(indices), self._n_bits), dtype=np.float32)
-
-        # Fill cached rows
-        for pos in cached_positions:
-            out[pos] = self._cache[indices[pos]]
-
-        # Compute uncached rows on-the-fly (without caching)
-        if uncached_smiles:
-            fps = compute_ecfp(uncached_smiles, radius=self._radius, n_bits=self._n_bits)
-            for i, pos in enumerate(uncached_positions):
-                out[pos] = fps[i]
-
-        return out
+        subset = [self._smiles[i] for i in indices]
+        return compute_ecfp(subset, radius=self._radius, n_bits=self._n_bits)

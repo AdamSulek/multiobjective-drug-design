@@ -8,11 +8,19 @@ import numpy as np
 from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
 from .model import build_model, mc_predict, predict_eval, train_model
-from .pareto import hypervolume_2d
+from .pareto import hypervolume_2d, hypervolume_3d
 
 
-def _nan_metrics(n_obj: int = 2) -> dict:
-    """Return a metrics dict filled with NaN (for iterations with no model)."""
+def _hv(Y: np.ndarray, ref_point: tuple[float, ...]) -> float:
+    m = Y.shape[1]
+    if m == 2:
+        return hypervolume_2d(Y, ref_point)
+    if m == 3:
+        return hypervolume_3d(Y, ref_point)
+    raise ValueError(f"Only 2D/3D supported, got m={m}")
+
+
+def _nan_metrics(n_obj: int) -> dict:
     nan_list = [float("nan")] * n_obj
     return {"mse": list(nan_list), "mae": list(nan_list), "r2": list(nan_list)}
 
@@ -44,7 +52,7 @@ class ALState:
 
     labeled_indices: list[int] = field(default_factory=list)
     unlabeled_indices: list[int] = field(default_factory=list)
-    Y_labeled: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))
+    Y_labeled: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=float))
     hv_history: list[float] = field(default_factory=list)
     selections_per_iter: list[list[int]] = field(default_factory=list)
     acq_time_per_iter: list[float] = field(default_factory=list)
@@ -87,6 +95,7 @@ def run_al_loop(
     import time  # upewnij się, że masz; możesz też przenieść do importów na górze pliku
 
     N = len(Y_pool)
+    n_obj = int(Y_pool.shape[1])
     al = config.al
     mcfg = config.model
 
@@ -123,12 +132,13 @@ def run_al_loop(
     state.selections_per_iter.append(list(labeled))
 
     # initial HV
-    hv0 = hypervolume_2d(state.Y_labeled, al.ref_point)
+    # hv0 = hypervolume_2d(state.Y_labeled, al.ref_point)
+    hv0 = _hv(state.Y_labeled, al.ref_point)
     state.hv_history.append(hv0)
     state.acq_time_per_iter.append(0.0)  # no acquisition at seed
-    state.train_metrics.append(_nan_metrics())
-    state.val_metrics.append(_nan_metrics())
-    state.sel_metrics.append(_nan_metrics())
+    state.train_metrics.append(_nan_metrics(n_obj))
+    state.val_metrics.append(_nan_metrics(n_obj))
+    state.sel_metrics.append(_nan_metrics(n_obj))
 
     print(
         f"[{acq_fn.name}] seed  | "
@@ -140,7 +150,7 @@ def run_al_loop(
         state.iteration = it
 
         # 1) train model from scratch on labeled set (normalize targets)
-        model = build_model(mcfg, device=config.device)
+        model = build_model(config.model, device=config.device, out_features=Y_pool.shape[1])
 
         X_train = X_pool[state.labeled_indices]
         Y_train = state.Y_labeled
@@ -185,15 +195,46 @@ def run_al_loop(
 
         # 3) acquisition: select next batch (indices local to unlabeled list)
         t0 = time.perf_counter()
+        
         sel_local = acq_fn.select(
             means, stds, state.Y_labeled, al.ref_point, k=al.batch_size, covs=covs
         )
-        acq_elapsed = time.perf_counter() - t0
-        state.acq_time_per_iter.append(acq_elapsed)
 
-        # map local -> pool indices
+        # --- normalize sel_local to 1D int array
+        sel_local = np.asarray(sel_local).astype(int).ravel()
+        U = len(state.unlabeled_indices)
+        N = len(Y_pool)
+
+        if sel_local.size == 0:
+            raise RuntimeError("acq_fn.select returned empty selection")
+
+        # If indices are out of range for unlabeled, assume they are POOL indices and map -> local
+        if sel_local.min() < 0 or sel_local.max() >= U:
+            # sanity: if they look like pool indices
+            if sel_local.min() >= 0 and sel_local.max() < N:
+                # map pool_idx -> local position in unlabeled
+                pos = {pool_idx: j for j, pool_idx in enumerate(state.unlabeled_indices)}
+                try:
+                    sel_local = np.array([pos[p] for p in sel_local], dtype=int)
+                except KeyError as e:
+                    raise RuntimeError(
+                        f"acq_fn.select returned pool index not in unlabeled set: {e}. "
+                        "Strategy is selecting already-labeled points."
+                    ) from e
+            else:
+                raise RuntimeError(
+                    f"sel_local indices out of range and not valid pool indices: "
+                    f"min={sel_local.min()} max={sel_local.max()} "
+                    f"(unlabeled size U={U}, pool size N={N})"
+                )
+
+        # Optionally enforce unique + correct count
+        sel_local = np.unique(sel_local)
+        if sel_local.size > al.batch_size:
+            sel_local = sel_local[-al.batch_size:]  # keep last (or re-sort by score if you want)
+
+        # map local -> pool
         sel_pool = [state.unlabeled_indices[i] for i in sel_local]
-        state.selections_per_iter.append(list(sel_pool))
 
         # 4) "label" — oracle lookup
         new_labels = Y_pool[sel_pool]
@@ -219,24 +260,31 @@ def run_al_loop(
             Y_unlabeled_true = Y_pool[unlabeled_snapshot]
             val_m = compute_regression_metrics(Y_unlabeled_true, means)
         else:
-            val_m = _nan_metrics()
+            val_m = _nan_metrics(n_obj)
         state.val_metrics.append(val_m)
 
         # 7) hypervolume
-        hv = hypervolume_2d(state.Y_labeled, al.ref_point)
+        # hv = hypervolume_2d(state.Y_labeled, al.ref_point)
+        hv = _hv(state.Y_labeled, al.ref_point)
         state.hv_history.append(hv)
 
         # console output
-        tmse = f"[{train_m['mse'][0]:.4f},{train_m['mse'][1]:.4f}]"
-        tr2 = f"[{train_m['r2'][0]:.2f},{train_m['r2'][1]:.2f}]"
+        def _fmt_list(xs, fmt):
+            return "[" + ",".join(format(float(x), fmt) for x in xs) + "]"
+
+        tmse = _fmt_list(train_m["mse"], ".4f")
+        tr2  = _fmt_list(train_m["r2"],  ".2f")
+
         line = (
             f"[{acq_fn.name}] it {it:3d} | "
-            f"labeled={len(state.labeled_indices):4d}  HV={hv:.4f}  acq={acq_elapsed:.3f}s"
+            f"labeled={len(state.labeled_indices):4d}  HV={hv:.4f}  acq={state.acq_time_per_iter[-1]:.3f}s"
             f"  train_MSE={tmse} R2={tr2}"
         )
+
+        # jeśli walidacja była liczona, to MSE[0] nie będzie NaN
         if not np.isnan(val_m["mse"][0]):
-            vmse = f"[{val_m['mse'][0]:.4f},{val_m['mse'][1]:.4f}]"
-            vr2 = f"[{val_m['r2'][0]:.2f},{val_m['r2'][1]:.2f}]"
+            vmse = _fmt_list(val_m["mse"], ".4f")
+            vr2  = _fmt_list(val_m["r2"],  ".2f")
             line += f"  val_MSE={vmse} R2={vr2}"
         print(line)
 

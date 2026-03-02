@@ -1,15 +1,19 @@
 """Acquisition function registry and factory."""
 
 from .base import AcquisitionFunction
+from .ellipse import EllipseAcquisition
 from .ellipse_fast import FastEllipseAcquisition
+from .exploitation import ExploitationAcquisition
 from .random import RandomAcquisition
 from .ucb import UCBExplorationAcquisition
 from .ellipse_direction import EllipseDirectionAcquisition
 
 
 REGISTRY: dict[str, type[AcquisitionFunction]] = {
+    "exploitation": ExploitationAcquisition,
     "ucb": UCBExplorationAcquisition,
     "random": RandomAcquisition,
+    "ellipse": EllipseAcquisition,
     "ellipse_fast": FastEllipseAcquisition,
     "ellipse_directions": EllipseDirectionAcquisition,
 }
