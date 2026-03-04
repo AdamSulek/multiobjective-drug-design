@@ -56,6 +56,10 @@ class FastEllipseAcquisition(AcquisitionFunction):
     @property
     def name(self) -> str:
         return f"FastEllipse3D(k={self.k}, D={self.n_directions})"
+    
+    @property
+    def needs_full_cov(self) -> bool:
+        return True
 
     def score(
         self,

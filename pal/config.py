@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from typing import Tuple
-
+import torch
 
 @dataclass
 class DataConfig:
@@ -46,5 +46,5 @@ class ExperimentConfig:
     ecfp_radius: int = 2
     ecfp_nbits: int = 2048
     output_dir: str = "pal_results"
-    device: str = "cpu"
+    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     obj_names: Tuple[str, str] = ("Objective 0", "Objective 1")

@@ -19,7 +19,197 @@ from typing import Tuple
 
 import numpy as np
 
+# -----------------------------
+# Pareto (MAX): keep nondominated
+# -----------------------------
+def pareto_front_max(Y: np.ndarray) -> np.ndarray:
+    """
+    Return nondominated points for MAX objectives.
+    O(n^2) worst-case, but n here should be Pareto-size (small vs pool).
+    """
+    Y = np.asarray(Y, dtype=float)
+    if Y.size == 0:
+        return Y.reshape(0, Y.shape[1])
 
+    n, m = Y.shape
+    keep = np.ones(n, dtype=bool)
+
+    # Simple dominance check
+    for i in range(n):
+        if not keep[i]:
+            continue
+        # If there exists j that dominates i => drop i
+        # j dominates i if all >= and any >
+        ge = (Y >= Y[i]).all(axis=1)
+        gt = (Y >  Y[i]).any(axis=1)
+        dom_i = ge & gt
+        dom_i[i] = False
+        if dom_i.any():
+            keep[i] = False
+            continue
+
+        # i dominates j => drop j
+        ge2 = (Y[i] >= Y).all(axis=1)
+        gt2 = (Y[i] >  Y).any(axis=1)
+        dom_j = ge2 & gt2
+        dom_j[i] = False
+        keep[dom_j] = False
+
+    return Y[keep]
+
+
+# -----------------------------
+# 2D hypervolume for MAX
+# -----------------------------
+def hypervolume_2d_max(P: np.ndarray, ref: tuple[float, float]) -> float:
+    """
+    HV for MAX in 2D relative to ref (ref is "worse": <= all points).
+    Uses standard staircase: sort by y desc, keep increasing z.
+    """
+    P = np.asarray(P, dtype=float)
+    if P.size == 0:
+        return 0.0
+    ry, rz = float(ref[0]), float(ref[1])
+
+    # Keep only points above ref (defensive)
+    P = P[(P[:, 0] >= ry) & (P[:, 1] >= rz)]
+    if P.size == 0:
+        return 0.0
+
+    # Sort by y descending, then z descending
+    idx = np.lexsort((-P[:, 1], -P[:, 0]))
+    P = P[idx]
+
+    # Build 2D front in (y,z): as y goes down, z must go strictly up to contribute
+    z_cummax = np.maximum.accumulate(P[:, 1])
+    # Keep points that increase z (first always kept)
+    inc = np.empty(P.shape[0], dtype=bool)
+    inc[0] = True
+    inc[1:] = z_cummax[1:] > z_cummax[:-1]
+    F = P[inc]
+    if F.size == 0:
+        return 0.0
+
+    # Now F has y strictly decreasing (or non-increasing with ties),
+    # and z strictly increasing.
+    y = F[:, 0]
+    z = F[:, 1]
+
+    # Area = sum over steps: (y_i - y_{i+1}) * (z_i - rz), with last y_{k+1}=ry
+    y_next = np.r_[y[1:], ry]
+    dy = y - y_next
+    dz = z - rz
+
+    # Clip for safety
+    dy = np.maximum(dy, 0.0)
+    dz = np.maximum(dz, 0.0)
+
+    return float(np.sum(dy * dz))
+
+
+# -----------------------------
+# 3D fast HV for MAX (sweep x)
+# -----------------------------
+def hypervolume_3d_max_fast(Y: np.ndarray, ref: tuple[float, float, float]) -> float:
+    """
+    Fast-ish HV 3D for MAX using:
+      1) filter to Pareto front (MAX)
+      2) sort by x desc
+      3) sweep unique x slabs, maintain yz front and compute 2D HV in yz
+
+    Complexity ~ O(p * log p + u * cost(front_update)), where p = Pareto size,
+    u = #unique x on Pareto. Front update here is vectorized + small loops on removed points.
+    """
+    Y = np.asarray(Y, dtype=float)
+    if Y.size == 0:
+        return 0.0
+    rx, ry, rz = map(float, ref)
+
+    # Keep only points above ref (defensive)
+    Y = Y[(Y[:, 0] >= rx) & (Y[:, 1] >= ry) & (Y[:, 2] >= rz)]
+    if Y.size == 0:
+        return 0.0
+
+    # Pareto reduce in 3D (MAX)
+    P = pareto_front_max(Y)
+    if P.size == 0:
+        return 0.0
+
+    # Sort by x descending; group by x
+    order = np.argsort(-P[:, 0], kind="mergesort")
+    P = P[order]
+
+    x_vals = P[:, 0]
+    # unique x in descending order + start indices
+    ux, start = np.unique(x_vals, return_index=True)
+    # ux returned is ascending by default; we want descending
+    # since P is sorted desc, start aligns with desc order already only if we take unique on reversed.
+    # Fix robustly:
+    ux = np.unique(x_vals)              # ascending
+    ux = ux[::-1]                       # descending
+    # For each unique x, find slice in P
+    # We'll use boolean mask each step based on x threshold (vectorized)
+    # but still only u steps where u = unique x on Pareto.
+
+    hv = 0.0
+    active_yz = np.empty((0, 2), dtype=float)
+
+    # Sweep slabs: from current x to next x (or ref_x)
+    for i, x in enumerate(ux):
+        x_next = ux[i + 1] if i + 1 < len(ux) else rx
+        dx = x - x_next
+        if dx <= 0:
+            continue
+
+        # Add all points with this x into active set (yz)
+        # Find points with x == current
+        pts = P[P[:, 0] == x][:, 1:3]  # (y,z)
+
+        if pts.size:
+            active_yz = np.vstack([active_yz, pts])
+
+            # Reduce active_yz to 2D Pareto front in (y,z) for MAX
+            # Efficient staircase method:
+            # sort by y desc, keep increasing z
+            idx = np.lexsort((-active_yz[:, 1], -active_yz[:, 0]))
+            S = active_yz[idx]
+            z_cummax = np.maximum.accumulate(S[:, 1])
+            inc = np.empty(S.shape[0], dtype=bool)
+            inc[0] = True
+            inc[1:] = z_cummax[1:] > z_cummax[:-1]
+            active_yz = S[inc]
+
+        # Area of union in yz for this slab
+        area = hypervolume_2d_max(active_yz, (ry, rz))
+        hv += dx * area
+
+    return float(hv)
+
+
+# -----------------------------
+# Simple tracker for AL loop
+# -----------------------------
+class HV3DFastTracker:
+    """
+    Keep a growing set of labeled points and compute 3D MAX HV quickly
+    by recomputing on Pareto only.
+    This is already a huge win vs recomputing on all labeled if labeled gets big.
+    """
+    def __init__(self, ref_point: tuple[float, float, float]):
+        self.ref = tuple(map(float, ref_point))
+        self._points = np.empty((0, 3), dtype=float)
+
+    def reset_and_compute(self, Y_labeled: np.ndarray) -> float:
+        self._points = np.asarray(Y_labeled, dtype=float).copy()
+        return hypervolume_3d_max_fast(self._points, self.ref)
+
+    def add_points(self, new_Y: np.ndarray) -> float:
+        new_Y = np.asarray(new_Y, dtype=float)
+        if new_Y.size == 0:
+            return hypervolume_3d_max_fast(self._points, self.ref)
+        self._points = np.vstack([self._points, new_Y])
+        return hypervolume_3d_max_fast(self._points, self.ref)
+    
 # ============================================================
 # Generic ND Pareto front (works for 2D/3D/Nd)
 # ============================================================

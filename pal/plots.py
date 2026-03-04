@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Tuple
-
+from typing import Any, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -11,12 +10,15 @@ from .pipeline import StrategyResult
 from .pareto import pareto_front_2d, build_stair_polygon  # still 2D for now
 
 import os
+
 # -------------------------------------------------
 # Utilities
 # -------------------------------------------------
 
 def _pick_median_replicate(res: StrategyResult):
-    final_hvs = [h[-1] for h in res.hv_histories]
+    final_hvs = [h[-1] for h in res.hv_histories if len(h) > 0]
+    if len(final_hvs) == 0:
+        return res.states[0]
     median_hv = np.median(final_hvs)
     idx = int(np.argmin(np.abs(np.array(final_hvs) - median_hv)))
     return res.states[idx]
@@ -77,6 +79,17 @@ def _extract_hv_matrix(strategy_result: Any) -> np.ndarray:
         * 1D np.ndarray (n_steps,)  -> treated as single replicate
     - strategy_result is itself a list of replicate dicts, each having ["hv"]
     """
+    # Case 0: our native StrategyResult (dataclass)
+    if isinstance(strategy_result, StrategyResult):
+        hv_histories = strategy_result.hv_histories  # List[List[float]]
+        n_reps = len(hv_histories)
+        n_steps = max((len(h) for h in hv_histories), default=0)
+
+        hv_mat = np.full((n_reps, n_steps), np.nan, dtype=float)
+        for r, h in enumerate(hv_histories):
+            hv_mat[r, :len(h)] = np.asarray(h, dtype=float)
+        return hv_mat
+    
     # Case A: dict with key "hv"
     if isinstance(strategy_result, dict) and "hv" in strategy_result:
         hv = strategy_result["hv"]

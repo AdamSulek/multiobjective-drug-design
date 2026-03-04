@@ -27,7 +27,7 @@ from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
 from .data import generate_zinc_dataset, load_dataset_from_file
 from .featurizer import LazyECFP, compute_ecfp
-from .pareto import hypervolume_2d, hypervolume_3d  # will be swapped later (2D->3D) centrally
+from .pareto import hypervolume_2d, hypervolume_3d_max_fast  # will be swapped later (2D->3D) centrally
 
 from .pipeline import (
     run_comparison,
@@ -300,13 +300,17 @@ def main() -> None:
         type=str,
         nargs="*",
         default=None,
-        help="Names of objective columns to negate. "
-            "Example: --negate_cols 3GVB 6D6P",
+        help="Example: --negate_cols score_3GVB score_6D6P"
     )
 
     parser.add_argument("--k_list", type=int, nargs="+", default=[1, 2, 3, 4], help="List of k values for UCB/ellipse.")
     parser.add_argument("--ucb_include_k0", action="store_true", help="Also run UCB with k=0 (pure exploitation).")
-
+    parser.add_argument(
+        "--global_pareto_file",
+        type=str,
+        default=None,
+        help="CSV/parquet z globalnym Pareto frontem (musi zawierać property_cols).",
+    )
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -351,19 +355,41 @@ def main() -> None:
             f"got {len(args.ref_point)}"
         )
 
+    if not np.all(np.isfinite(args.ref_point)):
+        raise ValueError(f"Invalid ref_point computed: {args.ref_point}")
+
     config.al.ref_point = tuple(args.ref_point)
     
-    # Oracle HV (still 2D; will be generalized later)
     oracle_hv = None
-    logging.info(f"Skipping oracle HV (pool size = {len(Y_pool)})\n")
-    # if Y_pool.shape[1] == 2:
-    #     oracle_hv = hypervolume_2d(Y_pool, config.al.ref_point)
-    # elif Y_pool.shape[1] == 3:
-    #     oracle_hv = hypervolume_3d(Y_pool, config.al.ref_point)
-    # else:
-    #     raise ValueError("Only 2D/3D supported")
+    if args.global_pareto_file is not None:
+        ext = args.global_pareto_file.rsplit(".", 1)[-1].lower()
+        if ext == "parquet":
+            df_gp = pd.read_parquet(args.global_pareto_file)
+        elif ext in ("csv", "tsv"):
+            df_gp = pd.read_csv(args.global_pareto_file)
+        else:
+            raise ValueError(f"Unsupported global_pareto_file extension: .{ext}")
 
-    # logging.info(f"Oracle HV = {oracle_hv:.4f}  (pool size = {len(Y_pool)})\n")
+        missing = [c for c in args.property_cols if c not in df_gp.columns]
+        if missing:
+            raise ValueError(f"Columns not found in global_pareto_file: {missing}")
+
+        Y_gp = df_gp[args.property_cols].to_numpy(dtype=np.float32)
+
+        # neguj te same cele co w _load_pool_data()
+        if args.negate_cols:
+            for col in args.negate_cols:
+                j = args.property_cols.index(col)  # zakłada pełne nazwy kolumn
+                Y_gp[:, j] = -Y_gp[:, j]
+
+        if Y_gp.shape[1] == 2:
+            oracle_hv = hypervolume_2d(Y_gp, config.al.ref_point)
+        elif Y_gp.shape[1] == 3:
+            oracle_hv = hypervolume_3d_max_fast(Y_gp, config.al.ref_point)
+        else:
+            raise ValueError("Only 2D/3D supported")
+
+        logging.info(f"Global Pareto HV = {oracle_hv:.6f} (|GP|={len(Y_gp)})")
 
     # Strategies
     strategies = _build_strategies(args)
@@ -400,8 +426,8 @@ def main() -> None:
     # Plots + CSV
     plot_hv_convergence(
         results,
-        oracle_hv=None,
-        config=cofig,
+        oracle_hv,
+        config,
         save_path=os.path.join(args.output_dir, "hv_convergence.png"),
     )
     plot_pareto_snapshots(

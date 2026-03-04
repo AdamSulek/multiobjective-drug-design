@@ -45,6 +45,10 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
     @property
     def name(self) -> str:
         return f"EllipseDirections3D(k={self.k}, W={self.W.shape[0]})"
+    
+    @property
+    def needs_full_cov(self) -> bool:
+        return True
 
     def score(
         self,
