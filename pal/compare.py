@@ -70,7 +70,11 @@ def _build_strategies(args: argparse.Namespace) -> Dict[str, AcquisitionFunction
     if "ucb" in args.strategies:
         ucb_ks = ([0] if args.ucb_include_k0 else []) + list(args.k_list)
         for k in ucb_ks:
-            strategies[f"ucb_k{k}"] = get_acquisition("ucb", k_ucb=float(k))
+            strategies[f"ucb_k{k}"] = get_acquisition(
+                "ucb",
+                k_ucb=float(k),
+                max_exact_candidates=args.ucb_max_exact_candidates,
+            )
 
     # ellipse_fast
     if "ellipse_fast" in args.strategies:
@@ -305,6 +309,15 @@ def main() -> None:
 
     parser.add_argument("--k_list", type=int, nargs="+", default=[1, 2, 3, 4], help="List of k values for UCB/ellipse.")
     parser.add_argument("--ucb_include_k0", action="store_true", help="Also run UCB with k=0 (pure exploitation).")
+    parser.add_argument(
+        "--ucb_max_exact_candidates",
+        type=int,
+        default=None,
+        help=(
+            "Limit exact UCB HV scoring to top-K prefiltered candidates. "
+            "If omitted, UCB with k>=2 uses 50000 by default."
+        ),
+    )
     parser.add_argument(
         "--global_pareto_file",
         type=str,

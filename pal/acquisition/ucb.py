@@ -17,8 +17,17 @@ from ..pareto_3D import (
 class UCBExplorationAcquisition(AcquisitionFunction):
     """Upper Confidence Bound: score = delta-HV of optimistic point."""
 
-    def __init__(self, k_ucb: float = 2.0):
+    def __init__(self, k_ucb: float = 2.0, max_exact_candidates: int | None = None):
         self.k_ucb = float(k_ucb)
+        # For larger k, optimistic sets can get very large.
+        # Limit exact HV scoring to a prefiltered subset.
+        if max_exact_candidates is None and self.k_ucb >= 2.0:
+            max_exact_candidates = 50_000
+        self.max_exact_candidates = (
+            int(max_exact_candidates)
+            if max_exact_candidates is not None and int(max_exact_candidates) > 0
+            else None
+        )
 
     @property
     def name(self) -> str:
@@ -66,6 +75,12 @@ class UCBExplorationAcquisition(AcquisitionFunction):
         #    - only NONDOMINATED (sticks out) can improve HV
         scores = np.zeros((optimistic.shape[0],), dtype=np.float64)
         nd_idx = np.where(~dominated)[0]
+        if self.max_exact_candidates is not None and nd_idx.size > self.max_exact_candidates:
+            ref = np.asarray(ref_point, dtype=np.float64).reshape(1, 3)
+            slack = np.clip(optimistic[nd_idx] - ref, a_min=0.0, a_max=None)
+            cheap = np.prod(slack, axis=1)
+            top_local = np.argpartition(cheap, -self.max_exact_candidates)[-self.max_exact_candidates:]
+            nd_idx = nd_idx[top_local]
 
         for i in nd_idx:
             scores[i] = score_point(

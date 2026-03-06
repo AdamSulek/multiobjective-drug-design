@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
-
+import os
 from .pipeline import StrategyResult
 from .pareto import pareto_front_2d, build_stair_polygon  # still 2D for now
 
