@@ -24,9 +24,10 @@ class FastEllipseAcquisition(AcquisitionFunction):
         Number of angles to sample on the ellipse boundary. Default 64.
     """
 
-    def __init__(self, k: float = 2.0, n_angles: int = 64):
+    def __init__(self, k: float = 2.0, n_angles: int = 64, zero_negative_hv: bool = False):
         self.k = k
         self.n_angles = n_angles
+        self.zero_negative_hv = bool(zero_negative_hv)
 
     @property
     def name(self) -> str:
@@ -46,7 +47,12 @@ class FastEllipseAcquisition(AcquisitionFunction):
 
         if covs is None:
             # No covariance — just score the means via batch delta-HV
-            return batch_delta_hv_2d(front, means, ref_point).astype(np.float32)
+            return batch_delta_hv_2d(
+                front,
+                means,
+                ref_point,
+                compute_negative=not self.zero_negative_hv,
+            ).astype(np.float32)
 
         # --- 1. Unit circle ---
         thetas = np.linspace(0, 2 * np.pi, A, endpoint=False)
@@ -88,7 +94,12 @@ class FastEllipseAcquisition(AcquisitionFunction):
         if len(flat_points) == 0:
             return np.zeros(N, dtype=np.float32)
 
-        flat_dhv = batch_delta_hv_2d(front, flat_points, ref_point)  # (K,)
+        flat_dhv = batch_delta_hv_2d(
+            front,
+            flat_points,
+            ref_point,
+            compute_negative=not self.zero_negative_hv,
+        )  # (K,)
 
         # --- 6. Max delta-HV per candidate ---
         scores = np.full(N, -np.inf, dtype=np.float64)

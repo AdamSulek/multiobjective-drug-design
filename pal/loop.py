@@ -1,6 +1,7 @@
 """Core active-learning loop."""
 
 import time
+import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -9,7 +10,7 @@ import numpy as np
 from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
 from .model import build_model, mc_predict, predict_eval, train_model
-from .pareto import batch_delta_hv_3d, pareto_front
+from .pareto import hypervolume_2d
 from .pareto_3D import (
     pareto_front_3d_max,
     hv_3d_max,
@@ -96,6 +97,7 @@ def run_al_loop(
     mcfg = config.model
 
     rng = np.random.default_rng(seed)
+    select_params = set(inspect.signature(acq_fn.select).parameters.keys())
 
     # --- choose initial labeled set (seed) ---
     if seed_indices is None:
@@ -143,10 +145,13 @@ def run_al_loop(
     # --- main loop ---
     for it in range(1, al.n_iterations + 1):
         state.iteration = it
+        iter_t0 = time.perf_counter()
 
         # 1) train model from scratch on labeled set (normalize targets)
+        t0 = time.perf_counter()
         with timed("build_model"):
             model = build_model(config.model, device=config.device, out_features=Y_pool.shape[1])
+        t_build = time.perf_counter() - t0
 
         X_train = X_pool[state.labeled_indices]
         Y_train = state.Y_labeled
@@ -155,6 +160,7 @@ def run_al_loop(
         Y_std = np.maximum(Y_train.std(axis=0), 1e-8)
         Y_train_norm = (Y_train - Y_mean) / Y_std
 
+        t0 = time.perf_counter()
         with timed("train_model"):
             train_model(
                 model,
@@ -171,10 +177,13 @@ def run_al_loop(
                 lr_scheduler_patience=mcfg.lr_scheduler_patience,
                 lr_scheduler_factor=mcfg.lr_scheduler_factor,
             )
+        t_train = time.perf_counter() - t0
 
         # training metrics (denormalize predictions)
+        t0 = time.perf_counter()
         with timed("predict_eval(train)"):
             Y_train_pred = predict_eval(model, X_train, device=config.device)
+        t_pred_train = time.perf_counter() - t0
         Y_train_pred = Y_train_pred * Y_std + Y_mean
         train_m = compute_regression_metrics(Y_train, Y_train_pred)
         state.train_metrics.append(train_m)
@@ -191,13 +200,16 @@ def run_al_loop(
         # - otherwise do normal MC on whole pool (what you had).
         if needs_cov:
             # --- A) cheap global pass (NO MC, NO cov) ---
+            t0 = time.perf_counter()
             with timed("predict_eval(unlabeled)"):
                 means = predict_eval(model, X_unlabeled, device=config.device)   # (U,d)
+            t_pred_unlabeled = time.perf_counter() - t0
             means = means * Y_std + Y_mean
             stds = None
             covs = None
         else:
             # --- normal path (MC on whole unlabeled) ---
+            t0 = time.perf_counter()
             with timed("mc_predict(unlabeled)"):
                 means, stds, covs = mc_predict(
                     model,
@@ -205,6 +217,7 @@ def run_al_loop(
                     n_passes=mcfg.mc_passes,
                     device=config.device,
                 )
+            t_pred_unlabeled = time.perf_counter() - t0
             means = means * Y_std + Y_mean
             stds = stds * Y_std
             covs = covs * np.outer(Y_std, Y_std)[None, :, :]
@@ -235,12 +248,10 @@ def run_al_loop(
         means_top = None
         stds_top = None
         covs_top = None
+        t_pred_topk = 0.0
 
         if needs_cov:
             U = len(state.unlabeled_indices)
-
-            # 1) build current front once
-            front_now = pareto_front_3d_max(state.Y_labeled.astype(np.float32))
 
             # 2) cheap score on means (delta-HV on mean)
             logging.info(f"[TOPK] starting cheap_score: U={U}")
@@ -278,6 +289,7 @@ def run_al_loop(
             X_top = X_unlabeled[top_local]
             logging.info(f"[TOPK] it={it} U={U} K={len(top_local)} (top={K_top}, rand={len(top_local)-K_top})")
             
+            t0 = time.perf_counter()
             with timed("mc_predict(topK cov)"):
                 means_top, stds_top, covs_top = mc_predict(
                     model,
@@ -285,6 +297,7 @@ def run_al_loop(
                     n_passes=mcfg.mc_passes,
                     device=config.device,
                 )
+            t_pred_topk = time.perf_counter() - t0
 
             means_top = means_top * Y_std + Y_mean
             stds_top = stds_top * Y_std
@@ -298,16 +311,23 @@ def run_al_loop(
                     f"means_top={means_top.shape} stds_top={stds_top.shape} covs_top={covs_top.shape}"
                 )
                 # select within topK space
+                select_kwargs = {
+                    "k": al.batch_size,
+                    "covs": covs_top,
+                }
+                if "pareto_front" in select_params:
+                    select_kwargs["pareto_front"] = pareto_front
+                if "pareto_dom_index" in select_params:
+                    select_kwargs["pareto_dom_index"] = dom_index
+                if "pareto_hv" in select_params:
+                    select_kwargs["pareto_hv"] = hv_front
+
                 sel_local_top = acq_fn.select(
                     means_top,
                     stds_top,
                     state.Y_labeled,
                     al.ref_point,
-                    k=al.batch_size,
-                    covs=covs_top,
-                    pareto_front=pareto_front,
-                    pareto_dom_index=dom_index,
-                    pareto_hv=hv_front,
+                    **select_kwargs,
                 )
                 sel_local_top = np.asarray(sel_local_top).astype(int).ravel()
                 sel_local = top_local[sel_local_top]   # map back to unlabeled-local indices
@@ -318,16 +338,23 @@ def run_al_loop(
                     f"[ACQ] needs_cov=False: calling select on FULL "
                     f"means={means.shape} stds={std_shape} covs={cov_shape}"
                 )
+                select_kwargs = {
+                    "k": al.batch_size,
+                    "covs": covs,
+                }
+                if "pareto_front" in select_params:
+                    select_kwargs["pareto_front"] = pareto_front
+                if "pareto_dom_index" in select_params:
+                    select_kwargs["pareto_dom_index"] = dom_index
+                if "pareto_hv" in select_params:
+                    select_kwargs["pareto_hv"] = hv_front
+
                 sel_local = acq_fn.select(
                     means,
                     stds,
                     state.Y_labeled,
                     al.ref_point,
-                    k=al.batch_size,
-                    covs=covs,
-                    pareto_front=pareto_front,
-                    pareto_dom_index=dom_index,
-                    pareto_hv=hv_front,
+                    **select_kwargs,
                 )
         state.acq_time_per_iter.append(time.perf_counter() - t0)
 
@@ -402,10 +429,13 @@ def run_al_loop(
         state.val_metrics.append(val_m)
 
         # 7) hypervolume (overall labeled)
+        t0 = time.perf_counter()
         with timed("hv(labeled_total)"):
             hv = _hv(state.Y_labeled, al.ref_point)
             hv_gain = hv - state.hv_history[-1]
+        t_hv = time.perf_counter() - t0
         state.hv_history.append(hv)
+        t_iter = time.perf_counter() - iter_t0
 
         # console output
         def _fmt_list(xs, fmt):
@@ -417,7 +447,7 @@ def run_al_loop(
         line = (
             f"[{acq_fn.name}] it {it:3d} | "
             f"labeled={len(state.labeled_indices):4d}  HV={hv:.4f}  (+{hv_gain:.4f})"
-            f"acq={state.acq_time_per_iter[-1]:.3f}s"
+            f"  acq={state.acq_time_per_iter[-1]:.3f}s"
             f"  train_MSE={tmse} R2={tr2}"
         )
 
@@ -426,5 +456,10 @@ def run_al_loop(
             vr2  = _fmt_list(val_m["r2"],  ".2f")
             line += f"  val_MSE={vmse} R2={vr2}"
         logging.info(line)
+        logging.info(
+            f"[TIME] [{acq_fn.name}] it {it:3d} | total={t_iter:.3f}s build={t_build:.3f}s "
+            f"train={t_train:.3f}s pred_train={t_pred_train:.3f}s pred_unlab={t_pred_unlabeled:.3f}s "
+            f"pred_topk={t_pred_topk:.3f}s acq={state.acq_time_per_iter[-1]:.3f}s hv={t_hv:.3f}s"
+        )
 
     return state

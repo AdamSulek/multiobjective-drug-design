@@ -2,11 +2,11 @@ import pandas as pd
 import numpy as np
 
 # === pliki wejściowe / wyjściowe ===
-INPUT_PARQUET = "savi_merged_all_3.parquet"
-OUTPUT_PARQUET = "savi_3D_wo_X.parquet"
+INPUT_PARQUET = "data/savi_data_3.parquet"
+OUTPUT_PARQUET = "data/3D/savi_3D_wo_X.parquet"
 
-IDS_NPY = "ids.npy"
-X_NPY = "X_uint8.npy"
+IDS_NPY = "data/3D/ids.npy"
+X_NPY = "data/3D/X_uint8.npy"
 
 ID_COLUMN = "ID"          # <- zmień jeśli masz inną nazwę
 X_COLUMN = "X_ecfp_2"

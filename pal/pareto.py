@@ -342,12 +342,19 @@ def build_stair_polygon(front: np.ndarray, ref: Tuple[float, float]) -> np.ndarr
 # 2D batch delta-HV (your original, kept)
 # ============================================================
 
-def batch_delta_hv_2d(front: np.ndarray, candidates: np.ndarray, ref: Tuple[float, float]) -> np.ndarray:
+def batch_delta_hv_2d(
+    front: np.ndarray,
+    candidates: np.ndarray,
+    ref: Tuple[float, float],
+    *,
+    compute_negative: bool = True,
+) -> np.ndarray:
     """Vectorized delta-HV for a batch of 2D candidate points.
 
     Returns:
     - positive exact ΔHV for nondominated candidates
-    - negative "gap area" for dominated/behind-ref (Option B)
+    - if ``compute_negative=True``: negative "gap area" for dominated/behind-ref (Option B)
+    - if ``compute_negative=False``: zeros for dominated/behind-ref
     """
     rx, ry = float(ref[0]), float(ref[1])
     cands = np.asarray(candidates, dtype=float).reshape(-1, 2)
@@ -366,7 +373,7 @@ def batch_delta_hv_2d(front: np.ndarray, candidates: np.ndarray, ref: Tuple[floa
         delta[valid] = (px[valid] - rx) * (py[valid] - ry)
 
         need_dist = ~valid
-        if np.any(need_dist):
+        if compute_negative and np.any(need_dist):
             dist_v = ry - py
             dist_h = rx - px
             dv_pos = dist_v > 0
@@ -413,7 +420,7 @@ def batch_delta_hv_2d(front: np.ndarray, candidates: np.ndarray, ref: Tuple[floa
     delta = np.maximum(delta, 0.0)
 
     need_dist = dominated | ~valid
-    if np.any(need_dist):
+    if compute_negative and np.any(need_dist):
         dist_v = y_below - py
         stair_x = np.where(py <= ry, rx, fx_at_k)
         dist_h = stair_x - px
@@ -550,14 +557,20 @@ def _gap_volume_3d(front_nd: np.ndarray, p: np.ndarray, ref: Tuple[float, float,
     return float(np.min(gaps))
 
 
-def batch_delta_hv_3d(front: np.ndarray, candidates: np.ndarray, ref: Tuple[float, float, float]) -> np.ndarray:
+def batch_delta_hv_3d(
+    front: np.ndarray,
+    candidates: np.ndarray,
+    ref: Tuple[float, float, float],
+    *,
+    compute_negative: bool = True,
+) -> np.ndarray:
     """
     Exact delta-HV for a batch of 3D candidate points.
 
     Returns:
     - positive ΔHV if candidate increases HV (i.e., is "above" front)
-    - negative "gap volume" (Option B) if candidate is dominated / under front / behind ref
-      so you can rank by "less negative = closer to front".
+    - if ``compute_negative=True``: negative "gap volume" (Option B) for dominated/behind-ref
+    - if ``compute_negative=False``: zeros for dominated/behind-ref.
 
     Notes:
     - This implementation computes HV(front) once, and HV(front ∪ {p}) per candidate.
@@ -597,9 +610,11 @@ def batch_delta_hv_3d(front: np.ndarray, candidates: np.ndarray, ref: Tuple[floa
 
         if delta > 0.0:
             out[i] = float(delta)
-        else:
+        elif compute_negative:
             # Option B: negative "gap volume" under the front
             gap = _gap_volume_3d(F_nd, p, (rx, ry, rz))
             out[i] = -float(gap)
+        else:
+            out[i] = 0.0
 
     return out

@@ -11,9 +11,11 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         self,
         k: float = 2.0,
         w_directions: Optional[np.ndarray] = None,  # (W,2)
+        use_front_penalty: bool = True,
         eps: float = 1e-9,
     ):
         self.k = float(k)
+        self.use_front_penalty = bool(use_front_penalty)
         self.eps = float(eps)
 
         if w_directions is None:
@@ -47,7 +49,7 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         front = pareto_front_2d(np.asarray(current_labels, dtype=np.float32))  # (M',2)
 
         # penalties(w) = max_p w^T p
-        if front.shape[0] == 0:
+        if (not self.use_front_penalty) or front.shape[0] == 0:
             penalties = np.zeros((W.shape[0],), dtype=np.float32)
         else:
             penalties = (front @ W.T).max(axis=0).astype(np.float32)  # (W,)
