@@ -193,6 +193,7 @@ def run_al_loop(
 
         #is_fast_ellipse = ("FastEllipse3D" in acq_fn.name) or ("ellipse_fast" in acq_fn.name.lower())
         needs_cov = getattr(acq_fn, "needs_full_cov", False)
+        needs_uncertainty = getattr(acq_fn, "needs_uncertainty", True)
 
         # For huge pools:
         # - if strategy needs full covariance (ellipse*), do cheap mean on whole pool,
@@ -207,7 +208,7 @@ def run_al_loop(
             means = means * Y_std + Y_mean
             stds = None
             covs = None
-        else:
+        elif needs_uncertainty:
             # --- normal path (MC on whole unlabeled) ---
             t0 = time.perf_counter()
             with timed("mc_predict(unlabeled)"):
@@ -221,6 +222,15 @@ def run_al_loop(
             means = means * Y_std + Y_mean
             stds = stds * Y_std
             covs = covs * np.outer(Y_std, Y_std)[None, :, :]
+        else:
+            # --- greedy path (no uncertainty needed, e.g. UCB k=0) ---
+            t0 = time.perf_counter()
+            with timed("predict_eval(unlabeled, no-uncertainty)"):
+                means = predict_eval(model, X_unlabeled, device=config.device)
+            t_pred_unlabeled = time.perf_counter() - t0
+            means = means * Y_std + Y_mean
+            stds = np.zeros_like(means, dtype=np.float32)
+            covs = None
 
         # --- Pareto/Fenwick precompute for this iteration (3D only) ---
         pareto_front = None

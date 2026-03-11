@@ -19,6 +19,11 @@ class UCBExplorationAcquisition(AcquisitionFunction):
     def name(self) -> str:
         return f"UCB(k={self.k_ucb})"
 
+    @property
+    def needs_uncertainty(self) -> bool:
+        # k=0 is greedy on predictive mean; MC uncertainty is unnecessary.
+        return self.k_ucb > 0.0
+
     def score(
         self,
         means: np.ndarray,
