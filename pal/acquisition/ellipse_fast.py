@@ -8,7 +8,7 @@ import numpy as np
 from ..pareto import (
     batch_delta_hv_2d,
     batch_delta_hv_3d,
-    pareto_front,
+    pareto_front_max_3d_fast,
     pareto_front_2d,
 )
 from .base import AcquisitionFunction
@@ -88,7 +88,7 @@ class FastEllipseAcquisition(AcquisitionFunction):
             thetas = np.linspace(0.0, 2.0 * np.pi, self.n_directions, endpoint=False)
             dirs = np.stack([np.cos(thetas), np.sin(thetas)], axis=1).astype(np.float32)
         else:
-            front = pareto_front(np.asarray(current_labels, dtype=np.float32))
+            front = pareto_front_max_3d_fast(np.asarray(current_labels, dtype=np.float32))
             dirs = self._dirs_3d
 
         N = means.shape[0]

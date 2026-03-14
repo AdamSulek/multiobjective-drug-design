@@ -618,3 +618,181 @@ def batch_delta_hv_3d(
             out[i] = 0.0
 
     return out
+
+
+def pareto_front_max_3d_fast(Y: np.ndarray) -> np.ndarray:
+    """
+    Pareto front for MAXIMIZATION in 3D.
+    Zwykle dużo szybsze niż naiwny O(n^2).
+
+    Zwraca punkty niezdominowane.
+    """
+    Y = np.asarray(Y, dtype=float)
+    if Y.size == 0:
+        return Y.reshape(0, 3)
+
+    Y = Y[np.isfinite(Y).all(axis=1)]
+    if Y.size == 0:
+        return Y.reshape(0, 3)
+
+    # sort: x desc, y desc, z desc
+    order = np.lexsort((-Y[:, 2], -Y[:, 1], -Y[:, 0]))
+    Y = Y[order]
+
+    front = []
+    yz_front = []  # lista punktów (y, z), utrzymywana jako schodek: y rośnie, z maleje
+
+    i = 0
+    n = len(Y)
+
+    while i < n:
+        x_val = Y[i, 0]
+        j = i
+        while j < n and Y[j, 0] == x_val:
+            j += 1
+
+        block = Y[i:j]
+
+        # najpierw sprawdzamy dominację tylko przez wcześniejsze (większe x)
+        keep_local = np.ones(len(block), dtype=bool)
+        for k, (_, y, z) in enumerate(block):
+            dominated = False
+            # sprawdź czy istnieje punkt z y' >= y i z' >= z
+            for yf, zf in yz_front:
+                if yf >= y and zf >= z:
+                    dominated = True
+                    break
+            keep_local[k] = not dominated
+
+        block_kept = block[keep_local]
+
+        if len(block_kept):
+            # wewnątrz bloku tego samego x jeszcze 2D Pareto po (y,z)
+            # MAX/MAX, sort y desc, z desc
+            o2 = np.lexsort((-block_kept[:, 2], -block_kept[:, 1]))
+            bz = block_kept[o2]
+
+            best_z = -np.inf
+            block_front = []
+            for p in bz:
+                if p[2] > best_z:
+                    block_front.append(p)
+                    best_z = p[2]
+
+            block_front = np.asarray(block_front, dtype=float)
+            front.extend(block_front)
+
+            # zaktualizuj yz_front i zrób z niego schodek
+            yz_front.extend((p[1], p[2]) for p in block_front)
+            yz_front.sort(key=lambda t: t[0])  # y asc
+
+            new_yz = []
+            best_z = -np.inf
+            # usuwamy punkty zdominowane w 2D, idąc od dużego y
+            for y, z in reversed(yz_front):
+                if z > best_z:
+                    new_yz.append((y, z))
+                    best_z = z
+            yz_front = list(reversed(new_yz))
+
+        i = j
+
+    return np.asarray(front, dtype=float)
+
+
+class FenwickMax:
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.bit = np.full(n + 1, -np.inf, dtype=np.float64)
+
+    def update(self, i: int, v: float) -> None:
+        while i <= self.n:
+            if v > self.bit[i]:
+                self.bit[i] = v
+            i += i & -i
+
+    def query(self, i: int) -> float:
+        out = -np.inf
+        while i > 0:
+            if self.bit[i] > out:
+                out = self.bit[i]
+            i -= i & -i
+        return out
+
+
+def pareto_front_3d_fenwick(points: np.ndarray) -> np.ndarray:
+    """
+    3D Pareto front for MAXIMIZATION.
+    Zwykle dużo szybsze niż naiwny O(n^2).
+    """
+    P = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    P = P[np.isfinite(P).all(axis=1)]
+    if len(P) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    # sort: x desc, then y desc, then z desc
+    order = np.lexsort((-P[:, 2], -P[:, 1], -P[:, 0]))
+    P = P[order]
+
+    # compress y (ascending), reversed index => suffix(y>=py) becomes prefix query
+    ys = np.unique(P[:, 1])
+    M = len(ys)
+
+    def rev_idx(y: float) -> int:
+        pos = np.searchsorted(ys, y, side="left")
+        if pos == M:
+            return 0
+        return M - pos
+
+    bit = FenwickMax(M)
+    front_blocks = []
+
+    i = 0
+    n = len(P)
+
+    while i < n:
+        x = P[i, 0]
+        j = i
+        while j < n and P[j, 0] == x:
+            j += 1
+
+        block = P[i:j]
+
+        # 1) screen vs points with strictly larger x
+        keep = np.ones(len(block), dtype=bool)
+        for k, (_, y, z) in enumerate(block):
+            ridx = rev_idx(y)
+            if ridx > 0 and bit.query(ridx) >= z:
+                keep[k] = False
+
+        block = block[keep]
+        if len(block) == 0:
+            i = j
+            continue
+
+        # 2) local Pareto in (y,z) for equal x
+        # sort y desc, z desc; keep only z-improving points
+        o2 = np.lexsort((-block[:, 2], -block[:, 1]))
+        block = block[o2]
+
+        local = []
+        best_z = -np.inf
+        for p in block:
+            z = p[2]
+            if z > best_z:
+                local.append(p)
+                best_z = z
+
+        local = np.asarray(local, dtype=np.float64)
+        front_blocks.append(local)
+
+        # 3) update BIT after whole x-block
+        for _, y, z in local:
+            bit.update(rev_idx(y), z)
+
+        i = j
+
+    if not front_blocks:
+        return np.empty((0, 3), dtype=np.float64)
+
+    return np.vstack(front_blocks)

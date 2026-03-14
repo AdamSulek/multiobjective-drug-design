@@ -214,7 +214,7 @@ def main() -> None:
     parser.add_argument("--negate_cols", type=str, nargs="*", default=None)
     parser.add_argument("--k_list", type=int, nargs="+", default=[1, 2, 3, 4])
     parser.add_argument("--zero-negative-hv", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--direction-use-front-penalty", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--direction-use-front-penalty", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ucb_include_k0", action="store_true")
     parser.add_argument("--ucb_max_exact_candidates", type=int, default=None)
     parser.add_argument("--global_pareto_file", type=str, default=None)

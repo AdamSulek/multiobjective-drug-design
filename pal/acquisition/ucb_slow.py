@@ -5,13 +5,11 @@ from typing import Tuple
 import numpy as np
 
 from .base import AcquisitionFunction
-from ..pareto import batch_delta_hv_2d, pareto_front_2d
+from ..pareto import batch_delta_hv_2d, batch_delta_hv_3d, pareto_front_2d
 from ..pareto_3D import (
     pareto_front_3d_max,
-    hv_3d_max,
     build_dominance_index_3d,
     classify_dominated_offline,
-    score_point,
 )
 
 
@@ -26,12 +24,10 @@ class UCBExplorationAcquisition(AcquisitionFunction):
     ):
         self.k_ucb = float(k_ucb)
         self.clip_negative_hv = bool(clip_negative_hv)
-
         # For larger k, optimistic sets can get very large.
-        # Limit exact HV scoring to a prefiltered subset (3D fast path).
+        # Limit exact HV scoring to a prefiltered subset (clip=True path only).
         if max_exact_candidates is None and self.k_ucb >= 2.0:
             max_exact_candidates = 50_000
-
         self.max_exact_candidates = (
             int(max_exact_candidates)
             if max_exact_candidates is not None and int(max_exact_candidates) > 0
@@ -44,7 +40,7 @@ class UCBExplorationAcquisition(AcquisitionFunction):
 
     @property
     def needs_uncertainty(self) -> bool:
-        # k=0 is greedy on predictive mean; uncertainty is unnecessary.
+        # k=0 is greedy on predictive mean; MC uncertainty is unnecessary.
         return self.k_ucb > 0.0
 
     def score(
@@ -81,57 +77,34 @@ class UCBExplorationAcquisition(AcquisitionFunction):
         if n_obj != 3:
             raise ValueError(f"{self.name} supports only 2D/3D, got {n_obj} objectives")
 
-        # reuse precomputed front/hv/index if provided
+        # reuse precomputed front if provided
         if pareto_front is None:
             front = pareto_front_3d_max(np.asarray(current_labels, dtype=np.float64))
         else:
             front = np.asarray(pareto_front, dtype=np.float64)
 
-        if pareto_hv is None:
-            hv_front = hv_3d_max(front, ref_point)
-        else:
-            hv_front = float(pareto_hv)
+        # clip=False: evaluate full batch with compute_negative=True
+        # so dominated / below-ref candidates get negative scores instead of zeros.
+        if not self.clip_negative_hv:
+            return batch_delta_hv_3d(
+                front,
+                optimistic,
+                ref_point,
+                compute_negative=True,
+            ).astype(np.float32)
 
+        # clip=True fast path: we only need potentially positive candidates.
         if pareto_dom_index is None:
             dom_index = build_dominance_index_3d(front)
         else:
             dom_index = pareto_dom_index
 
-        scores = np.zeros((optimistic.shape[0],), dtype=np.float32)
-
-        # slow but exact path: keep negative HV
-        if not self.clip_negative_hv:
-            dominated = classify_dominated_offline(optimistic, dom_index)
-            nd_idx = np.where(~dominated)[0]
-
-            if self.max_exact_candidates is not None and nd_idx.size > self.max_exact_candidates:
-                ref_arr = np.asarray(ref_point, dtype=np.float64).reshape(1, 3)
-                slack = np.clip(optimistic[nd_idx] - ref_arr, a_min=0.0, a_max=None)
-                cheap = np.prod(slack, axis=1)
-                top_local = np.argpartition(cheap, -self.max_exact_candidates)[-self.max_exact_candidates:]
-                nd_idx = nd_idx[top_local]
-
-            for i in nd_idx:
-                scores[i] = score_point(
-                    optimistic[i],
-                    front,
-                    hv_front,
-                    ref_point,
-                    dominated_by_front=False,
-                )
-
-            return scores
-
-        # fast clipped path: only candidates that can have positive delta-HV
+        dominated = classify_dominated_offline(optimistic, dom_index)
         ref_arr = np.asarray(ref_point, dtype=np.float64).reshape(1, 3)
-        above_ref = np.all(optimistic > ref_arr, axis=1)
+        valid = np.all(optimistic > ref_arr, axis=1)
 
-        if np.any(above_ref):
-            valid_idx = np.where(above_ref)[0]
-            dominated_valid = classify_dominated_offline(optimistic[valid_idx], dom_index)
-            nd_idx = valid_idx[~dominated_valid]
-        else:
-            nd_idx = np.empty((0,), dtype=np.int64)
+        nd_idx = np.where(~dominated)[0]
+        nd_idx = nd_idx[valid[nd_idx]]
 
         if self.max_exact_candidates is not None and nd_idx.size > self.max_exact_candidates:
             slack = np.clip(optimistic[nd_idx] - ref_arr, a_min=0.0, a_max=None)
@@ -139,14 +112,15 @@ class UCBExplorationAcquisition(AcquisitionFunction):
             top_local = np.argpartition(cheap, -self.max_exact_candidates)[-self.max_exact_candidates:]
             nd_idx = nd_idx[top_local]
 
-        for i in nd_idx:
-            scores[i] = score_point(
-                optimistic[i],
+        scores = np.zeros((optimistic.shape[0],), dtype=np.float32)
+        if nd_idx.size > 0:
+            deltas = batch_delta_hv_3d(
                 front,
-                hv_front,
+                optimistic[nd_idx],
                 ref_point,
-                dominated_by_front=False,
-            )
+                compute_negative=False,
+            ).astype(np.float32)
+            scores[nd_idx] = deltas
 
         np.maximum(scores, 0.0, out=scores)
         return scores

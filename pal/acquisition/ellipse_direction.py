@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Tuple, Optional
 import numpy as np
 
-from ..pareto import pareto_front, pareto_front_2d
+from ..pareto import pareto_front_2d, pareto_front_max_3d_fast
 from .base import AcquisitionFunction
 
 
@@ -77,7 +77,7 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
             front = pareto_front_2d(np.asarray(current_labels, dtype=np.float32))
         else:
             W = self.W
-            front = pareto_front(np.asarray(current_labels, dtype=np.float32))
+            front = pareto_front_max_3d_fast(np.asarray(current_labels, dtype=np.float32))
 
         # alpha(i,w) = w^T pts(i,w) - penalties(w) ; optionally disable penalties term
         if self.use_front_penalty and front.shape[0] > 0:

@@ -327,7 +327,7 @@ def main() -> None:
     parser.add_argument(
         "--direction-use-front-penalty",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="For ellipse_directions, include the Pareto-front penalty term max_p w^T p. Default: enabled.",
     )
     parser.add_argument("--ucb_include_k0", action="store_true", help="Also run UCB with k=0 (pure exploitation).")

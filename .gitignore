@@ -225,3 +225,7 @@ data/3D
 data/pareto_global_3D.parquet
 data/savi_data_3.parquet
 data/savi_data.parquet
+a.err
+a.out
+a.py
+a.sh
