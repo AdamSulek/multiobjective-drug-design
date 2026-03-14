@@ -11,12 +11,18 @@ from .base import AcquisitionFunction
 class UCBExplorationAcquisition(AcquisitionFunction):
     """Upper Confidence Bound: score = delta-HV of optimistic point."""
 
-    def __init__(self, k_ucb: float = 2.0):
+    def __init__(self, k_ucb: float = 2.0, zero_negative_hv: bool = False):
         self.k_ucb = k_ucb
+        self.zero_negative_hv = bool(zero_negative_hv)
 
     @property
     def name(self) -> str:
         return f"UCB(k={self.k_ucb})"
+
+    @property
+    def needs_uncertainty(self) -> bool:
+        # k=0 is greedy on predictive mean; MC uncertainty is unnecessary.
+        return self.k_ucb > 0.0
 
     def score(
         self,
@@ -28,4 +34,9 @@ class UCBExplorationAcquisition(AcquisitionFunction):
     ) -> np.ndarray:
         front = pareto_front_2d(current_labels)
         optimistic = means + self.k_ucb * stds
-        return batch_delta_hv_2d(front, optimistic, ref_point).astype(np.float32)
+        return batch_delta_hv_2d(
+            front,
+            optimistic,
+            ref_point,
+            compute_negative=not self.zero_negative_hv,
+        ).astype(np.float32)

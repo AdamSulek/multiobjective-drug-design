@@ -74,17 +74,27 @@ def _build_strategies(args: argparse.Namespace) -> Dict[str, AcquisitionFunction
                 "ucb",
                 k_ucb=float(k),
                 max_exact_candidates=args.ucb_max_exact_candidates,
+                clip_negative_hv=args.clip_negative_hv,
             )
 
     # ellipse_fast
     if "ellipse_fast" in args.strategies:
         for k in args.k_list:
-            strategies[f"ellipse_fast_k{k}"] = get_acquisition("ellipse_fast", k=float(k))
+            strategies[f"ellipse_fast_k{k}"] = get_acquisition(
+                "ellipse_fast",
+                k=float(k),
+                clip_negative_hv=args.clip_negative_hv,
+            )
 
     # ellipse_directions
     if "ellipse_directions" in args.strategies:
         for k in args.k_list:
-            strategies[f"ellipse_directions_k{k}"] = get_acquisition("ellipse_directions", k=float(k))
+            strategies[f"ellipse_directions_k{k}"] = get_acquisition(
+                "ellipse_directions",
+                k=float(k),
+                clip_negative_hv=args.clip_negative_hv,
+                use_front_penalty=args.direction_use_front_penalty,
+            )
 
     return strategies
 
@@ -271,8 +281,8 @@ def main() -> None:
         "--strategies",
         type=str,
         nargs="+",
-        default=["exploitation", "ucb", "random", "ellipse_fast", "ellipse_directions"],
-        help="Acquisition functions to compare. Available: exploitation, ucb, random, ellipse_fast, ellipse_directions",
+        default=["ucb", "random", "ellipse_fast", "ellipse_directions"],
+        help="Acquisition functions to compare. Available: ucb, random, ellipse_fast, ellipse_directions",
     )
 
     parser.add_argument("--data_file", type=str, default=None, help="Path to CSV or parquet file with custom dataset")
@@ -308,6 +318,18 @@ def main() -> None:
     )
 
     parser.add_argument("--k_list", type=int, nargs="+", default=[1, 2, 3, 4], help="List of k values for UCB/ellipse.")
+    parser.add_argument(
+        "--clip-negative-hv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clip negative acquisition/HV deltas to 0. Default: enabled.",
+    )
+    parser.add_argument(
+        "--direction-use-front-penalty",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="For ellipse_directions, include the Pareto-front penalty term max_p w^T p. Default: enabled.",
+    )
     parser.add_argument("--ucb_include_k0", action="store_true", help="Also run UCB with k=0 (pure exploitation).")
     parser.add_argument(
         "--ucb_max_exact_candidates",

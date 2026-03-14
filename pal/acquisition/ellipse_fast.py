@@ -5,7 +5,12 @@ from typing import Tuple
 
 import numpy as np
 
-from ..pareto import batch_delta_hv_3d, pareto_front  # <- ND/3D versions
+from ..pareto import (
+    batch_delta_hv_2d,
+    batch_delta_hv_3d,
+    pareto_front_max_3d_fast,
+    pareto_front_2d,
+)
 from .base import AcquisitionFunction
 
 
@@ -48,14 +53,15 @@ class FastEllipseAcquisition(AcquisitionFunction):
         Number of directions sampled on the sphere. Default 50.
     """
 
-    def __init__(self, k: float = 2.0, n_directions: int = 50):
+    def __init__(self, k: float = 2.0, n_directions: int = 50, clip_negative_hv: bool = True):
         self.k = float(k)
         self.n_directions = int(n_directions)
-        self._dirs = fibonacci_sphere_directions(self.n_directions)  # (D,3)
+        self.clip_negative_hv = bool(clip_negative_hv)
+        self._dirs_3d = fibonacci_sphere_directions(self.n_directions)  # (D,3)
 
     @property
     def name(self) -> str:
-        return f"FastEllipse3D(k={self.k}, D={self.n_directions})"
+        return f"FastEllipse(k={self.k}, D={self.n_directions})"
     
     @property
     def needs_full_cov(self) -> bool:
@@ -72,27 +78,53 @@ class FastEllipseAcquisition(AcquisitionFunction):
     ) -> np.ndarray:
         means = np.asarray(means, dtype=np.float32)
         stds = np.asarray(stds, dtype=np.float32)
-        front = pareto_front(np.asarray(current_labels, dtype=np.float32))  # (M',3)
+        n_obj = int(means.shape[1])
+
+        if n_obj not in (2, 3):
+            raise ValueError(f"{self.name} supports only 2D/3D, got {n_obj} objectives")
+
+        if n_obj == 2:
+            front = pareto_front_2d(np.asarray(current_labels, dtype=np.float32))
+            thetas = np.linspace(0.0, 2.0 * np.pi, self.n_directions, endpoint=False)
+            dirs = np.stack([np.cos(thetas), np.sin(thetas)], axis=1).astype(np.float32)
+        else:
+            front = pareto_front_max_3d_fast(np.asarray(current_labels, dtype=np.float32))
+            dirs = self._dirs_3d
 
         N = means.shape[0]
-        D = self._dirs.shape[0]
 
         if covs is None:
-            # No covariance — just score the means via batch delta-HV (3D)
-            return batch_delta_hv_3d(front, means, ref_point).astype(np.float32)
+            # No covariance — just score the means via batch delta-HV.
+            if n_obj == 2:
+                scores0 = batch_delta_hv_2d(
+                    front,
+                    means,
+                    ref_point,
+                    compute_negative=not self.clip_negative_hv,
+                ).astype(np.float32)
+            else:
+                scores0 = batch_delta_hv_3d(
+                    front,
+                    means,
+                    ref_point,
+                    compute_negative=not self.clip_negative_hv,
+                ).astype(np.float32)
+            if self.clip_negative_hv:
+                np.maximum(scores0, 0.0, out=scores0)
+            return scores0
 
         # --- 1) Directions on unit sphere ---
-        dirs = self._dirs  # (D,3)
+        D = dirs.shape[0]
 
         # --- 2) Batch Cholesky on (N,3,3) ---
         cov_arr = np.asarray(covs, dtype=np.float64)
-        cov_arr = cov_arr + 1e-9 * np.eye(3, dtype=np.float64)[None, :, :]
+        cov_arr = cov_arr + 1e-9 * np.eye(n_obj, dtype=np.float64)[None, :, :]
 
         try:
-            L = np.linalg.cholesky(cov_arr)  # (N,3,3)
+            L = np.linalg.cholesky(cov_arr)  # (N,m,m)
         except np.linalg.LinAlgError:
             # Fallback: per-candidate Cholesky with diagonal backup
-            L = np.zeros((N, 3, 3), dtype=np.float64)
+            L = np.zeros((N, n_obj, n_obj), dtype=np.float64)
             for i in range(N):
                 try:
                     L[i] = np.linalg.cholesky(cov_arr[i])
@@ -117,11 +149,27 @@ class FastEllipseAcquisition(AcquisitionFunction):
         if flat_points.shape[0] == 0:
             return np.zeros(N, dtype=np.float32)
 
-        # --- 5) Batch delta-HV in 3D ---
-        flat_dhv = batch_delta_hv_3d(front, flat_points, ref_point)  # (K,)
+        # --- 5) Batch delta-HV ---
+        if n_obj == 2:
+            flat_dhv = batch_delta_hv_2d(
+                front,
+                flat_points,
+                ref_point,
+                compute_negative=not self.clip_negative_hv,
+            )  # (K,)
+        else:
+            flat_dhv = batch_delta_hv_3d(
+                front,
+                flat_points,
+                ref_point,
+                compute_negative=not self.clip_negative_hv,
+            )  # (K,)
 
         # --- 6) Max delta-HV per candidate ---
         scores = np.full(N, -np.inf, dtype=np.float64)
         np.maximum.at(scores, flat_cand, flat_dhv.astype(np.float64))
 
-        return scores.astype(np.float32)
+        scores = scores.astype(np.float32)
+        if self.clip_negative_hv:
+            np.maximum(scores, 0.0, out=scores)
+        return scores

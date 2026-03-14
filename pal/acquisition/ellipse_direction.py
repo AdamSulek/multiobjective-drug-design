@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Tuple, Optional
 import numpy as np
 
-from ..pareto import pareto_front  # ND version
+from ..pareto import pareto_front_2d, pareto_front_max_3d_fast
 from .base import AcquisitionFunction
 
 
@@ -34,17 +34,21 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         self,
         k: float = 2.0,
         n_directions: int = 50,
+        use_front_penalty: bool = True,
+        clip_negative_hv: bool = True,
         eps: float = 1e-9,
     ):
         self.k = float(k)
         self.eps = float(eps)
-        self.d = 3
-        self.W = fibonacci_sphere_directions(n_directions)
+        self.n_directions = int(n_directions)
+        self.use_front_penalty = bool(use_front_penalty)
+        self.clip_negative_hv = bool(clip_negative_hv)
+        self.W = fibonacci_sphere_directions(self.n_directions)
         self.last_w_idx_max: Optional[np.ndarray] = None
 
     @property
     def name(self) -> str:
-        return f"EllipseDirections3D(k={self.k}, W={self.W.shape[0]})"
+        return f"EllipseDirections(k={self.k}, W={self.n_directions})"
     
     @property
     def needs_full_cov(self) -> bool:
@@ -55,32 +59,39 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         means: np.ndarray,                 # (N,3)
         stds: np.ndarray,                  # (N,3)
         current_labels: np.ndarray,        # (M,3)
-        ref_point: Tuple[float, float, float],  # unused
+        ref_point: Tuple[float, ...],  # unused
         covs: np.ndarray | None = None,    # (N,3,3)
         **kwargs,
     ) -> np.ndarray:
 
         means = np.asarray(means, dtype=np.float32)
         stds = np.asarray(stds, dtype=np.float32)
-        W = self.W
+        n_obj = int(means.shape[1])
 
-        # --- Pareto front (ND) ---
-        front = pareto_front(np.asarray(current_labels, dtype=np.float32))
+        if n_obj not in (2, 3):
+            raise ValueError(f"{self.name} supports only 2D/3D, got {n_obj} objectives")
 
-        # penalty(w) = max_p w^T p
-        if front.shape[0] == 0:
-            penalties = np.zeros((W.shape[0],), dtype=np.float32)
+        if n_obj == 2:
+            thetas = np.linspace(0.0, 2.0 * np.pi, self.n_directions, endpoint=False)
+            W = np.stack([np.cos(thetas), np.sin(thetas)], axis=1).astype(np.float32)
+            front = pareto_front_2d(np.asarray(current_labels, dtype=np.float32))
         else:
+            W = self.W
+            front = pareto_front_max_3d_fast(np.asarray(current_labels, dtype=np.float32))
+
+        # alpha(i,w) = w^T pts(i,w) - penalties(w) ; optionally disable penalties term
+        if self.use_front_penalty and front.shape[0] > 0:
             penalties = (front @ W.T).max(axis=0).astype(np.float32)
+        else:
+            penalties = np.zeros((W.shape[0],), dtype=np.float32)
 
         N = means.shape[0]
 
         # --- Covariance handling ---
         if covs is None:
-            covs_use = np.zeros((N, 3, 3), dtype=np.float32)
-            covs_use[:, 0, 0] = stds[:, 0] ** 2
-            covs_use[:, 1, 1] = stds[:, 1] ** 2
-            covs_use[:, 2, 2] = stds[:, 2] ** 2
+            covs_use = np.zeros((N, n_obj, n_obj), dtype=np.float32)
+            for j in range(n_obj):
+                covs_use[:, j, j] = stds[:, j] ** 2
         else:
             covs_use = np.asarray(covs, dtype=np.float32)
 
@@ -102,4 +113,6 @@ class EllipseDirectionAcquisition(AcquisitionFunction):
         scores = alpha[np.arange(N), best_w].astype(np.float32)
 
         self.last_w_idx_max = best_w
+        if self.clip_negative_hv:
+            np.maximum(scores, 0.0, out=scores)
         return scores
