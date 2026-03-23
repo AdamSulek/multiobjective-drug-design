@@ -1,4 +1,4 @@
-# pareto-al
+# multiobjective-drug-design
 
 ## Overview
 
@@ -20,11 +20,7 @@ The results (Figure 1) reveal clear differences in scalability. The EllipsoidDir
 
 In contrast, both UCB and EllipsoidFast demonstrate linear scaling with respect to the number of points (alpha = 1), but their total runtime increases significantly with dimensionality. This is primarily due to the need to compute hypervolume (HV) contributions relative to the Pareto front for both dominating and non-dominating points, which becomes increasingly expensive in higher dimensions.
 
-## Benchmark Results
-
-![Benchmark results](figures/benchmark.png)
-
-*Figure 1: Runtime scaling with respect to candidate pool size (left) and dimensionality (right).*
+## Complexity and time results
 
 We evaluate the runtime and scalability of the considered methods on synthetic datasets with controlled structure.
 
@@ -36,11 +32,23 @@ As dimensionality increases, UCB and E-Fast show a sharp rise in runtime due to 
 
 Overall, EllipsoidDirection provides the best scalability and computational efficiency, particularly in higher-dimensional settings.
 
+![Benchmark results](figures/benchmark.png)
+
+***Figure 1:** Runtime scaling with respect to candidate pool size (left) and dimensionality (right).*
+
+## 2D Multi-Target Optimization Results
+
+In the two-objective docking setting, the goal is to identify optimal candidate molecules defined by the Pareto front. Among the evaluated strategies, the Ellipse Direction method achieves solutions closest to the optimal trade-off, demonstrating superior efficiency in navigating the chemical space and converging toward high-quality candidates.
+
+![2D multi-target optimization](figures/2D_multitarget.png)
+
+*Figure 2.* Comparison of exploration strategies in the chemical space across two molecular targets (3GVB and 6D6P), shown against the full candidate space (gray points): random sampling (A), Upper Confidence Bound (UCB) (B–C), and the proposed methods: covariance-based Pareto front exploration (D) and directional multi-objective acquisition (E–F). These methods leverage a geometric approximation of model uncertainty in the form of covariance ellipsoids to guide the selection of new docking candidates. Color indicates the iteration of selection. Panel G shows the hypervolume growth of the Pareto front as the number of docking evaluations increases.
+
 ## 3D Multi-Target Optimization Results
 
 ![Pareto front growth (3D multi-target)](figures/pareto_animation_multitarget.gif)
 
-*Figure: Evolution of the Pareto front during optimization across three molecular objectives.*
+**Figure:** Evolution of the Pareto front during optimization across three molecular objectives.*
 
 This animation illustrates the incremental growth of the Pareto front in a three-objective optimization setting. Each step reflects the selection process within the active learning loop, where new candidates are added based on multi-objective criteria.
 
