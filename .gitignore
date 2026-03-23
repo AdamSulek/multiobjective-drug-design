@@ -206,26 +206,16 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-pal_test*/
-pal_results*/
 
-archive
 .idea
 results
 logs
-com.txt
-run.sh
-run2.sh
-y.err
-y.out
-y.sh
-extract_X_and_ids.py
-custom
+*.err
+*.out
+
+commands.txt
+
 data/3D
 data/pareto_global_3D.parquet
 data/savi_data_3.parquet
 data/savi_data.parquet
-a.err
-a.out
-a.py
-a.sh

@@ -214,6 +214,7 @@ def save_hv_csv(
         for r, (hv_history, state) in enumerate(zip(res.hv_histories, res.states)):
             for i, hv in enumerate(hv_history):
                 acq_time = state.acq_time_per_iter[i] if i < len(state.acq_time_per_iter) else 0.0
+                stage = state.iter_stage_times[i - 1] if (i > 0 and (i - 1) < len(state.iter_stage_times)) else {}
                 row = {
                     "strategy": res.name,
                     "replicate": r,
@@ -221,6 +222,13 @@ def save_hv_csv(
                     "n_labeled": config.al.seed_size + i * config.al.batch_size,
                     "hypervolume": float(hv),
                     "acq_time_s": float(acq_time),
+                    "iter_total_s": float(stage.get("total", 0.0)) if i > 0 else 0.0,
+                    "build_s": float(stage.get("build", 0.0)) if i > 0 else 0.0,
+                    "train_s": float(stage.get("train", 0.0)) if i > 0 else 0.0,
+                    "pred_train_s": float(stage.get("pred_train", 0.0)) if i > 0 else 0.0,
+                    "pred_unlab_s": float(stage.get("pred_unlab", 0.0)) if i > 0 else 0.0,
+                    "cov_reconstruct_s": float(stage.get("cov_reconstruct", 0.0)) if i > 0 else 0.0,
+                    "hv_eval_s": float(stage.get("hv", 0.0)) if i > 0 else 0.0,
                 }
 
                 # metrics lists may be shorter (e.g. val computed every N)

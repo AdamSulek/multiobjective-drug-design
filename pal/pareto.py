@@ -286,6 +286,30 @@ def pareto_front_2d(points: np.ndarray) -> np.ndarray:
     return np.asarray(front, dtype=float)
 
 
+# Compatibility helper used by older flexible acquisitions:
+# returns indices of 2D nondominated points (MAX/MAX).
+def pareto_front_2D(points: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=float).reshape(-1, 2)
+    finite = np.isfinite(pts).all(axis=1)
+    if not np.any(finite):
+        return np.empty((0,), dtype=int)
+
+    idx = np.flatnonzero(finite)
+    P = pts[idx]
+    n = P.shape[0]
+    dominated = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        if dominated[i]:
+            continue
+        ge_all = np.all(P >= P[i], axis=1)
+        gt_any = np.any(P > P[i], axis=1)
+        if np.any(ge_all & gt_any):
+            dominated[i] = True
+
+    return idx[~dominated].astype(int)
+
+
 # ============================================================
 # 2D HV + helpers (your original)
 # ============================================================
@@ -796,3 +820,57 @@ def pareto_front_3d_fenwick(points: np.ndarray) -> np.ndarray:
         return np.empty((0, 3), dtype=np.float64)
 
     return np.vstack(front_blocks)
+
+
+def pareto_skyline(X):
+    # X: (N, m)
+    idx = np.argsort(-X[:, 0])     # sort malejąco po pierwszym wymiarze
+    front = []
+
+    for i in idx:
+        x = X[i]
+        dominated = False
+        for j in front:
+            if np.all(X[j] >= x) and np.any(X[j] > x):
+                dominated = True
+                break
+        if not dominated:
+            front.append(i)
+
+    return np.array(front, dtype=int)
+
+
+def hypervolume_nd(front, ref):
+    front = np.asarray(front, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+
+    m = front.shape[1]
+    hv = 0.0
+
+    stack = [(front, ref, m)]
+
+    while stack:
+        P, r, dim = stack.pop()
+
+        if P.size == 0:
+            continue
+
+        if dim == 1:
+            hv += np.max(P[:,0]) - r[0]
+            continue
+
+        order = np.argsort(P[:,dim-1])
+        P = P[order]
+
+        prev = r[dim-1]
+
+        for i in range(len(P)):
+            level = P[i,dim-1]
+            width = level - prev
+            if width > 0:
+                active = P[i:,:dim-1]
+                stack.append((active, r[:dim-1], dim-1))
+                hv += width * 0  # contribution computed in lower dims
+            prev = level
+
+    return hv

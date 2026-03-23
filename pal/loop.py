@@ -1,7 +1,8 @@
 """Core active-learning loop."""
 
-import time
 import inspect
+import logging
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -12,14 +13,23 @@ from .config import ExperimentConfig
 from .model import build_model, mc_predict, predict_eval, train_model
 from .pareto import hypervolume_2d
 from .pareto_3D import (
-    pareto_front_3d_max,
-    hv_3d_max,
     build_dominance_index_3d,
+    hv_3d_max,
+    pareto_front_3d_max,
 )
 
-import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def _get_logger() -> logging.Logger:
+    pal_logger = logging.getLogger("pal")
+    if pal_logger.handlers:
+        return pal_logger
+    return logging.getLogger()
+
+
+LOGGER = _get_logger()
 
 
 @contextmanager
@@ -27,7 +37,7 @@ def timed(stage: str):
     t0 = time.perf_counter()
     yield
     dt = time.perf_counter() - t0
-    logging.info(f"[TIMER] {stage}: {dt:.3f}s")
+    LOGGER.info(f"[TIMER] {stage}: {dt:.3f}s")
 
 
 def _hv(Y: np.ndarray, ref_point: tuple[float, ...]) -> float:
@@ -46,17 +56,6 @@ def _nan_metrics(n_obj: int) -> dict:
 
 
 def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Compute MSE, MAE, R2 per objective column.
-
-    Parameters
-    ----------
-    y_true : np.ndarray, shape ``(N, n_obj)``
-    y_pred : np.ndarray, shape ``(N, n_obj)``
-
-    Returns
-    -------
-    dict with keys ``"mse"``, ``"mae"``, ``"r2"``; each a list of floats.
-    """
     residuals = y_true - y_pred
     mse = (residuals ** 2).mean(axis=0).tolist()
     mae = np.abs(residuals).mean(axis=0).tolist()
@@ -66,10 +65,82 @@ def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"mse": mse, "mae": mae, "r2": r2}
 
 
+def _summary_line(vals: list[float]) -> str:
+    if not vals:
+        return "sum=0.000s mean=0.000s std=0.000s min=0.000s max=0.000s"
+    arr = np.asarray(vals, dtype=float)
+    return (
+        f"sum={arr.sum():.3f}s mean={arr.mean():.3f}s std={arr.std(ddof=0):.3f}s "
+        f"min={arr.min():.3f}s max={arr.max():.3f}s"
+    )
+
+
+STAGE_KEYS = (
+    "total",
+    "build",
+    "train",
+    "pred_train",
+    "pred_unlab",
+    "cov_reconstruct",
+    "acq",
+    "hv",
+)
+
+
+def _log_timing_summary(acq_name: str, state: "ALState") -> None:
+    if not state.iter_stage_times:
+        return
+
+    LOGGER.info(
+        f"[TIME_SUMMARY] [{acq_name}] n_iters={len(state.iter_stage_times)} "
+        f"n_labeled_final={len(state.labeled_indices)}"
+    )
+    for key in STAGE_KEYS:
+        vals = [float(x.get(key, 0.0)) for x in state.iter_stage_times]
+        LOGGER.info(f"[TIME_SUMMARY] [{acq_name}] stage={key} {_summary_line(vals)}")
+
+
+def _predict_unlabeled(
+    *,
+    model,
+    X_unlabeled,
+    mcfg,
+    device: str,
+    needs_cov: bool,
+    needs_uncertainty: bool,
+    y_mean: np.ndarray,
+    y_std: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, float]:
+    if needs_cov or needs_uncertainty:
+        stage = "mc_predict(unlabeled_full_with_cov)" if needs_cov else "mc_predict(unlabeled)"
+        t0 = time.perf_counter()
+        with timed(stage):
+            means, stds, covs = mc_predict(
+                model,
+                X_unlabeled,
+                n_passes=mcfg.mc_passes,
+                device=device,
+            )
+        t_pred_unlabeled = time.perf_counter() - t0
+
+        means = means * y_std + y_mean
+        stds = stds * y_std
+        covs = covs * np.outer(y_std, y_std)[None, :, :]
+        return means, stds, covs, t_pred_unlabeled
+
+    t0 = time.perf_counter()
+    with timed("predict_eval(unlabeled, no-uncertainty)"):
+        means = predict_eval(model, X_unlabeled, device=device)
+    t_pred_unlabeled = time.perf_counter() - t0
+
+    means = means * y_std + y_mean
+    stds = np.zeros_like(means, dtype=np.float32)
+    covs = None
+    return means, stds, covs, t_pred_unlabeled
+
+
 @dataclass
 class ALState:
-    """Mutable state of one AL run."""
-
     labeled_indices: list[int] = field(default_factory=list)
     unlabeled_indices: list[int] = field(default_factory=list)
     Y_labeled: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=float))
@@ -79,6 +150,7 @@ class ALState:
     train_metrics: list[dict] = field(default_factory=list)
     val_metrics: list[dict] = field(default_factory=list)
     sel_metrics: list[dict] = field(default_factory=list)
+    iter_stage_times: list[dict] = field(default_factory=list)
     iteration: int = 0
 
 
@@ -90,7 +162,6 @@ def run_al_loop(
     seed: int,
     seed_indices: np.ndarray | None = None,
 ):
-    """Run a full active-learning loop."""
     N = len(Y_pool)
     n_obj = int(Y_pool.shape[1])
     al = config.al
@@ -99,12 +170,10 @@ def run_al_loop(
     rng = np.random.default_rng(seed)
     select_params = set(inspect.signature(acq_fn.select).parameters.keys())
 
-    # --- choose initial labeled set (seed) ---
     if seed_indices is None:
         labeled = rng.choice(N, size=al.seed_size, replace=False).astype(int).tolist()
     else:
         labeled_arr = np.array(seed_indices, dtype=int).ravel()
-
         if len(labeled_arr) != al.seed_size:
             raise ValueError(
                 f"seed_indices length={len(labeled_arr)} but seed_size={al.seed_size}"
@@ -113,41 +182,35 @@ def run_al_loop(
             raise ValueError(f"seed_indices out of range [0, {N-1}]")
         if len(np.unique(labeled_arr)) != len(labeled_arr):
             raise ValueError("seed_indices contain duplicates")
-
         labeled = labeled_arr.tolist()
 
     labeled_set = set(labeled)
     unlabeled = [i for i in range(N) if i not in labeled_set]
 
-    # --- init state ---
     state = ALState(
         labeled_indices=list(labeled),
         unlabeled_indices=list(unlabeled),
         Y_labeled=Y_pool[labeled].copy(),
     )
 
-    # record seed as iteration 0
     state.selections_per_iter.append(list(labeled))
 
-    # initial HV
     hv0 = _hv(state.Y_labeled, al.ref_point)
     state.hv_history.append(hv0)
-    state.acq_time_per_iter.append(0.0)  # no acquisition at seed
+    state.acq_time_per_iter.append(0.0)
     state.train_metrics.append(_nan_metrics(n_obj))
     state.val_metrics.append(_nan_metrics(n_obj))
     state.sel_metrics.append(_nan_metrics(n_obj))
 
-    logging.info(
+    LOGGER.info(
         f"[{acq_fn.name}] seed  | "
         f"labeled={len(state.labeled_indices):4d}  HV={hv0:.4f}  acq_time=0.000s"
     )
 
-    # --- main loop ---
     for it in range(1, al.n_iterations + 1):
         state.iteration = it
         iter_t0 = time.perf_counter()
 
-        # 1) train model from scratch on labeled set (normalize targets)
         t0 = time.perf_counter()
         with timed("build_model"):
             model = build_model(config.model, device=config.device, out_features=Y_pool.shape[1])
@@ -179,7 +242,6 @@ def run_al_loop(
             )
         t_train = time.perf_counter() - t0
 
-        # training metrics (denormalize predictions)
         t0 = time.perf_counter()
         with timed("predict_eval(train)"):
             Y_train_pred = predict_eval(model, X_train, device=config.device)
@@ -188,51 +250,28 @@ def run_al_loop(
         train_m = compute_regression_metrics(Y_train, Y_train_pred)
         state.train_metrics.append(train_m)
 
-        # 2) Predictions on unlabeled pool
         X_unlabeled = X_pool[state.unlabeled_indices]
 
-        #is_fast_ellipse = ("FastEllipse3D" in acq_fn.name) or ("ellipse_fast" in acq_fn.name.lower())
         needs_cov = getattr(acq_fn, "needs_full_cov", False)
         needs_uncertainty = getattr(acq_fn, "needs_uncertainty", True)
 
-        # For huge pools:
-        # - if strategy needs full covariance (ellipse*), do cheap mean on whole pool,
-        #   and MC+cov only on top-K later.
-        # - otherwise do normal MC on whole pool (what you had).
-        if needs_cov:
-            # --- A) cheap global pass (NO MC, NO cov) ---
-            t0 = time.perf_counter()
-            with timed("predict_eval(unlabeled)"):
-                means = predict_eval(model, X_unlabeled, device=config.device)   # (U,d)
-            t_pred_unlabeled = time.perf_counter() - t0
-            means = means * Y_std + Y_mean
-            stds = None
-            covs = None
-        elif needs_uncertainty:
-            # --- normal path (MC on whole unlabeled) ---
-            t0 = time.perf_counter()
-            with timed("mc_predict(unlabeled)"):
-                means, stds, covs = mc_predict(
-                    model,
-                    X_unlabeled,
-                    n_passes=mcfg.mc_passes,
-                    device=config.device,
-                )
-            t_pred_unlabeled = time.perf_counter() - t0
-            means = means * Y_std + Y_mean
-            stds = stds * Y_std
-            covs = covs * np.outer(Y_std, Y_std)[None, :, :]
-        else:
-            # --- greedy path (no uncertainty needed, e.g. UCB k=0) ---
-            t0 = time.perf_counter()
-            with timed("predict_eval(unlabeled, no-uncertainty)"):
-                means = predict_eval(model, X_unlabeled, device=config.device)
-            t_pred_unlabeled = time.perf_counter() - t0
-            means = means * Y_std + Y_mean
-            stds = np.zeros_like(means, dtype=np.float32)
-            covs = None
+        means = None
+        stds = None
+        covs = None
+        t_pred_unlabeled = 0.0
+        t_cov_reconstruct = 0.0
 
-        # --- Pareto/Fenwick precompute for this iteration (3D only) ---
+        means, stds, covs, t_pred_unlabeled = _predict_unlabeled(
+            model=model,
+            X_unlabeled=X_unlabeled,
+            mcfg=mcfg,
+            device=config.device,
+            needs_cov=needs_cov,
+            needs_uncertainty=needs_uncertainty,
+            y_mean=Y_mean,
+            y_std=Y_std,
+        )
+
         pareto_front = None
         hv_front = None
         dom_index = None
@@ -247,190 +286,83 @@ def run_al_loop(
             with timed("build_dominance_index_3d(front)"):
                 dom_index = build_dominance_index_3d(pareto_front)
 
-            logging.info(
+            LOGGER.info(
                 f"[PARETO] it={it} labeled={state.Y_labeled.shape[0]} "
                 f"front={pareto_front.shape[0]} hv_front={hv_front:.6f}"
             )
 
-        # 3) acquisition: select next batch (indices local to unlabeled list)
-        # --- Special 2-stage path for FastEllipse: cov only on top-K ---
-        top_local = None
-        means_top = None
-        stds_top = None
-        covs_top = None
-        t_pred_topk = 0.0
-
-        if needs_cov:
-            U = len(state.unlabeled_indices)
-
-            # 2) cheap score on means (delta-HV on mean)
-            logging.info(f"[TOPK] starting cheap_score: U={U}")
-
-            with timed("cheap_score(deltaHV on mean)"):
-                ref = np.asarray(al.ref_point, dtype=np.float32)
-                cheap = np.min(means.astype(np.float32) - ref[None, :], axis=1)
-
-            logging.info(f"[TOPK] cheap_score done. cheap shape={cheap.shape} max={float(np.max(cheap)):.6f}")
-
-            # 3) choose top-K candidates (mix top + random tail)
-            K = int(getattr(al, "ellipse_topk", 2000))  # or hardcode 2000 if you prefer
-            K = min(K, U)
-
-            frac_top = 0.8
-            K_top = int(frac_top * K)
-            K_rand = K - K_top
-
-            top_part = np.argpartition(cheap, -K_top)[-K_top:]
-
-            if K_rand > 0:
-                rng2 = np.random.default_rng(seed + 10_000 + it)
-                mask = np.ones(U, dtype=bool)
-                mask[top_part] = False
-                rest = np.flatnonzero(mask)
-                if rest.size > 0:
-                    rand_part = rng2.choice(rest, size=min(K_rand, rest.size), replace=False)
-                    top_local = np.concatenate([top_part, rand_part])
-                else:
-                    top_local = top_part
-            else:
-                top_local = top_part
-
-            # 4) MC+cov ONLY on top_local
-            X_top = X_unlabeled[top_local]
-            logging.info(f"[TOPK] it={it} U={U} K={len(top_local)} (top={K_top}, rand={len(top_local)-K_top})")
-            
-            t0 = time.perf_counter()
-            with timed("mc_predict(topK cov)"):
-                means_top, stds_top, covs_top = mc_predict(
-                    model,
-                    X_top,
-                    n_passes=mcfg.mc_passes,
-                    device=config.device,
-                )
-            t_pred_topk = time.perf_counter() - t0
-
-            means_top = means_top * Y_std + Y_mean
-            stds_top = stds_top * Y_std
-            covs_top = covs_top * np.outer(Y_std, Y_std)[None, :, :]
-    
         t0 = time.perf_counter()
         with timed("acquisition.select()"):
-            if needs_cov:
-                logging.info(
-                    f"[ACQ] needs_cov=True: calling select on TOPK "
-                    f"means_top={means_top.shape} stds_top={stds_top.shape} covs_top={covs_top.shape}"
-                )
-                # select within topK space
-                select_kwargs = {
-                    "k": al.batch_size,
-                    "covs": covs_top,
-                }
-                if "pareto_front" in select_params:
-                    select_kwargs["pareto_front"] = pareto_front
-                if "pareto_dom_index" in select_params:
-                    select_kwargs["pareto_dom_index"] = dom_index
-                if "pareto_hv" in select_params:
-                    select_kwargs["pareto_hv"] = hv_front
+            cov_shape = None if covs is None else covs.shape
+            std_shape = None if stds is None else stds.shape
+            LOGGER.info(
+                f"[ACQ] calling select "
+                f"means={means.shape} stds={std_shape} covs={cov_shape}"
+            )
 
-                sel_local_top = acq_fn.select(
-                    means_top,
-                    stds_top,
-                    state.Y_labeled,
-                    al.ref_point,
-                    **select_kwargs,
-                )
-                sel_local_top = np.asarray(sel_local_top).astype(int).ravel()
-                sel_local = top_local[sel_local_top]   # map back to unlabeled-local indices
-            else:
-                cov_shape = None if covs is None else covs.shape
-                std_shape = None if stds is None else stds.shape
-                logging.info(
-                    f"[ACQ] needs_cov=False: calling select on FULL "
-                    f"means={means.shape} stds={std_shape} covs={cov_shape}"
-                )
-                select_kwargs = {
-                    "k": al.batch_size,
-                    "covs": covs,
-                }
-                if "pareto_front" in select_params:
-                    select_kwargs["pareto_front"] = pareto_front
-                if "pareto_dom_index" in select_params:
-                    select_kwargs["pareto_dom_index"] = dom_index
-                if "pareto_hv" in select_params:
-                    select_kwargs["pareto_hv"] = hv_front
+            select_kwargs = {
+                "k": al.batch_size,
+                "covs": covs,
+            }
+            if "pareto_front" in select_params:
+                select_kwargs["pareto_front"] = pareto_front
+            if "pareto_dom_index" in select_params:
+                select_kwargs["pareto_dom_index"] = dom_index
+            if "pareto_hv" in select_params:
+                select_kwargs["pareto_hv"] = hv_front
 
-                sel_local = acq_fn.select(
-                    means,
-                    stds,
-                    state.Y_labeled,
-                    al.ref_point,
-                    **select_kwargs,
-                )
+            sel_local = acq_fn.select(
+                means,
+                stds,
+                state.Y_labeled,
+                al.ref_point,
+                **select_kwargs,
+            )
+
         state.acq_time_per_iter.append(time.perf_counter() - t0)
 
-        # --- normalize sel_local to 1D int array
         sel_local = np.asarray(sel_local).astype(int).ravel()
         U = len(state.unlabeled_indices)
-        N = len(Y_pool)
+        N_total = len(Y_pool)
 
         if sel_local.size == 0:
             raise RuntimeError("acq_fn.select returned empty selection")
 
-        # If indices are out of range for unlabeled, assume they are POOL indices and map -> local
         if sel_local.min() < 0 or sel_local.max() >= U:
-            if sel_local.min() >= 0 and sel_local.max() < N:
+            if sel_local.min() >= 0 and sel_local.max() < N_total:
                 pos = {pool_idx: j for j, pool_idx in enumerate(state.unlabeled_indices)}
                 try:
                     sel_local = np.array([pos[p] for p in sel_local], dtype=int)
                 except KeyError as e:
                     raise RuntimeError(
-                        f"acq_fn.select returned pool index not in unlabeled set: {e}. "
-                        "Strategy is selecting already-labeled points."
+                        f"acq_fn.select returned pool index not in unlabeled set: {e}"
                     ) from e
             else:
                 raise RuntimeError(
-                    f"sel_local indices out of range and not valid pool indices: "
-                    f"min={sel_local.min()} max={sel_local.max()} "
-                    f"(unlabeled size U={U}, pool size N={N})"
+                    f"sel_local indices out of range: min={sel_local.min()} max={sel_local.max()} "
+                    f"(U={U}, N={N_total})"
                 )
 
-        # Optionally enforce unique + correct count
         sel_local = np.unique(sel_local)
         if sel_local.size > al.batch_size:
             sel_local = sel_local[-al.batch_size:]
 
-        # map local -> pool
         sel_pool = [state.unlabeled_indices[i] for i in sel_local]
-
         state.selections_per_iter.append(list(sel_pool))
-        # 4) "label" — oracle lookup
+
         new_labels = Y_pool[sel_pool]
 
-        # selected-compounds metrics (MC means vs GT for selected points)
-        if needs_cov:
-            # sel_local are indices in unlabeled space; map them into top_local positions
-            pos = {int(u): j for j, u in enumerate(top_local)}
-            sel_pos = np.array([pos[int(u)] for u in sel_local], dtype=int)
-            sel_pred = means_top[sel_pos]
-        else:
-            sel_pred = means[sel_local]
-
+        sel_pred = means[sel_local]
         sel_m = compute_regression_metrics(new_labels, sel_pred)
-        
         state.sel_metrics.append(sel_m)
 
-        # snapshot of current unlabeled pool for validation metrics
         unlabeled_snapshot = list(state.unlabeled_indices)
 
-        # 5) update labeled/unlabeled sets
         sel_pool_set = set(sel_pool)
-
         state.labeled_indices.extend(sel_pool)
         state.Y_labeled = np.vstack([state.Y_labeled, new_labels])
-
         state.unlabeled_indices = [i for i in state.unlabeled_indices if i not in sel_pool_set]
 
-        # 6) validation metrics every val_every
         if it % al.val_every == 0:
             Y_unlabeled_true = Y_pool[unlabeled_snapshot]
             val_m = compute_regression_metrics(Y_unlabeled_true, means)
@@ -438,7 +370,6 @@ def run_al_loop(
             val_m = _nan_metrics(n_obj)
         state.val_metrics.append(val_m)
 
-        # 7) hypervolume (overall labeled)
         t0 = time.perf_counter()
         with timed("hv(labeled_total)"):
             hv = _hv(state.Y_labeled, al.ref_point)
@@ -447,12 +378,24 @@ def run_al_loop(
         state.hv_history.append(hv)
         t_iter = time.perf_counter() - iter_t0
 
-        # console output
+        state.iter_stage_times.append(
+            {
+                "total": float(t_iter),
+                "build": float(t_build),
+                "train": float(t_train),
+                "pred_train": float(t_pred_train),
+                "pred_unlab": float(t_pred_unlabeled),
+                "cov_reconstruct": float(t_cov_reconstruct),
+                "acq": float(state.acq_time_per_iter[-1]),
+                "hv": float(t_hv),
+            }
+        )
+
         def _fmt_list(xs, fmt):
             return "[" + ",".join(format(float(x), fmt) for x in xs) + "]"
 
         tmse = _fmt_list(train_m["mse"], ".4f")
-        tr2  = _fmt_list(train_m["r2"],  ".2f")
+        tr2 = _fmt_list(train_m["r2"], ".2f")
 
         line = (
             f"[{acq_fn.name}] it {it:3d} | "
@@ -463,13 +406,16 @@ def run_al_loop(
 
         if not np.isnan(val_m["mse"][0]):
             vmse = _fmt_list(val_m["mse"], ".4f")
-            vr2  = _fmt_list(val_m["r2"],  ".2f")
+            vr2 = _fmt_list(val_m["r2"], ".2f")
             line += f"  val_MSE={vmse} R2={vr2}"
-        logging.info(line)
-        logging.info(
-            f"[TIME] [{acq_fn.name}] it {it:3d} | total={t_iter:.3f}s build={t_build:.3f}s "
-            f"train={t_train:.3f}s pred_train={t_pred_train:.3f}s pred_unlab={t_pred_unlabeled:.3f}s "
-            f"pred_topk={t_pred_topk:.3f}s acq={state.acq_time_per_iter[-1]:.3f}s hv={t_hv:.3f}s"
+
+        LOGGER.info(line)
+        LOGGER.info(
+            f"[TIME] [{acq_fn.name}] it {it:3d} | total={t_iter:.3f}s "
+            f"build={t_build:.3f}s train={t_train:.3f}s pred_train={t_pred_train:.3f}s "
+            f"pred_unlab={t_pred_unlabeled:.3f}s "
+            f"cov_reconstruct={t_cov_reconstruct:.3f}s acq={state.acq_time_per_iter[-1]:.3f}s hv={t_hv:.3f}s"
         )
 
+    _log_timing_summary(acq_fn.name, state)
     return state

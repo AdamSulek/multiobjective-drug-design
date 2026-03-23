@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build performance tables from PAL result folders."""
+"""Generate PAL summary tables and HV plots in one command."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
 
 TIME_RE = re.compile(
     r"\[TIME\] \[(?P<strategy>.+?)\] it\s+(?P<it>\d+)\s+\| total=(?P<total>[0-9.]+)s"
@@ -26,7 +28,6 @@ NAME_2D_RE = re.compile(
 K_RE = re.compile(r"k=([0-9.]+)")
 
 
-
 def parse_oracle_hv(compare_log: Path) -> float | None:
     if not compare_log.exists():
         return None
@@ -37,7 +38,6 @@ def parse_oracle_hv(compare_log: Path) -> float | None:
     return None
 
 
-
 def is_run_done(run_dir: Path) -> bool:
     compare_log = run_dir / "compare.log"
     if not compare_log.exists():
@@ -46,10 +46,19 @@ def is_run_done(run_dir: Path) -> bool:
     return "Done!" in txt
 
 
+def filter_complete_strategy_replicates(hv: pd.DataFrame, target_iter: int) -> pd.DataFrame:
+    if hv.empty:
+        return hv
+    max_it = hv.groupby(["strategy", "replicate"], as_index=False)["iteration"].max()
+    done_keys = max_it[max_it["iteration"] >= int(target_iter)][["strategy", "replicate"]]
+    if done_keys.empty:
+        return hv.iloc[0:0].copy()
+    return hv.merge(done_keys, on=["strategy", "replicate"], how="inner")
+
 
 def parse_runtime_by_strategy(log_file: Path) -> pd.DataFrame:
     if not log_file.exists():
-        return pd.DataFrame(columns=["strategy", "replicate", "runtime_iter_s"])
+        return pd.DataFrame(columns=["strategy", "replicate", "runtime_total_s", "runtime_iter_s", "runtime_n_iters"])
 
     seq: dict[str, list[tuple[int, float]]] = defaultdict(list)
     for line in log_file.read_text(errors="replace").splitlines():
@@ -84,18 +93,6 @@ def parse_runtime_by_strategy(log_file: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-
-def filter_complete_strategy_replicates(hv: pd.DataFrame, target_iter: int) -> pd.DataFrame:
-    if hv.empty:
-        return hv
-    max_it = hv.groupby(["strategy", "replicate"], as_index=False)["iteration"].max()
-    done_keys = max_it[max_it["iteration"] >= int(target_iter)][["strategy", "replicate"]]
-    if done_keys.empty:
-        return hv.iloc[0:0].copy()
-    return hv.merge(done_keys, on=["strategy", "replicate"], how="inner")
-
-
-
 def strategy_to_method_k(strategy: str) -> tuple[str, str, int, float]:
     s = strategy.strip()
     if s.lower().startswith("random"):
@@ -117,14 +114,7 @@ def strategy_to_method_k(strategy: str) -> tuple[str, str, int, float]:
     return s, "–", 99, np.nan
 
 
-
-def collect_run_records(
-    run_dir: Path,
-    logs_root: Path,
-    target_iter: int,
-    *,
-    require_done: bool,
-) -> pd.DataFrame:
+def collect_run_records(run_dir: Path, logs_root: Path, target_iter: int, require_done: bool) -> pd.DataFrame:
     if require_done and not is_run_done(run_dir):
         return pd.DataFrame()
 
@@ -198,7 +188,6 @@ def collect_run_records(
     return pd.DataFrame(rows)
 
 
-
 def summarize(records: pd.DataFrame) -> pd.DataFrame:
     if records.empty:
         return records
@@ -227,7 +216,6 @@ def summarize(records: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-
 def write_table(out_dir: Path, name: str, table: pd.DataFrame) -> None:
     if table.empty:
         print(f"Skip (empty): {name}")
@@ -246,16 +234,65 @@ def write_table(out_dir: Path, name: str, table: pd.DataFrame) -> None:
     print(f"Saved: {md_path}")
 
 
+def load_case_df(run_dirs: Iterable[Path], target_iter: int, require_done: bool) -> tuple[pd.DataFrame, float | None]:
+    frames = []
+    oracle = None
+    for d in run_dirs:
+        if require_done and not is_run_done(d):
+            continue
+        hv_path = d / "hv_convergence.csv"
+        if not hv_path.exists():
+            continue
 
-def expand_dirs(results_root: Path, names: Iterable[str]) -> list[Path]:
-    out = []
-    for n in names:
-        p = Path(n)
-        if not p.is_absolute():
-            p = results_root / n
-        out.append(p)
-    return out
+        df = pd.read_csv(hv_path)
+        if require_done:
+            df = filter_complete_strategy_replicates(df, target_iter)
+            if df.empty:
+                continue
+        df["run_dir"] = d.name
+        frames.append(df)
 
+        if oracle is None:
+            oracle = parse_oracle_hv(d / "compare.log")
+
+    if not frames:
+        return pd.DataFrame(), None
+    return pd.concat(frames, ignore_index=True), oracle
+
+
+def plot_case(ax, df: pd.DataFrame, title: str, normalize: bool, oracle: float | None) -> None:
+    if df.empty:
+        ax.set_title(f"{title}\\n(no data)")
+        ax.grid(True, alpha=0.3)
+        return
+
+    y_col = "hypervolume"
+    if normalize and oracle and oracle > 0:
+        df = df.copy()
+        df[y_col] = df[y_col] / oracle
+        y_label = "HV / oracle"
+    else:
+        y_label = "Hypervolume"
+
+    plotted = 0
+    for strategy, g in df.groupby("strategy", sort=False):
+        pivot = g.pivot_table(index="replicate", columns="iteration", values=y_col, aggfunc="mean")
+        if pivot.empty:
+            continue
+        xs = np.array(sorted(pivot.columns), dtype=int)
+        vals = pivot[xs].to_numpy(dtype=float)
+        mean = np.nanmean(vals, axis=0)
+        std = np.nanstd(vals, axis=0)
+        ax.plot(xs, mean, label=strategy)
+        ax.fill_between(xs, mean - std, mean + std, alpha=0.2)
+        plotted += 1
+
+    ax.set_title(title)
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel(y_label)
+    ax.grid(True, alpha=0.3)
+    if plotted > 0:
+        ax.legend(fontsize=7)
 
 
 def auto_groups(results_root: Path) -> dict[str, list[Path]]:
@@ -266,13 +303,11 @@ def auto_groups(results_root: Path) -> dict[str, list[Path]]:
     for p in sorted(results_root.iterdir()):
         if not p.is_dir():
             continue
-
         m3 = NAME_3D_RE.match(p.name)
         if m3:
             key = f"3d_{m3.group('neg')}_{m3.group('clip')}"
             groups[key].append(p)
             continue
-
         m2 = NAME_2D_RE.match(p.name)
         if m2:
             key = f"2d_{m2.group('neg')}_{m2.group('clip')}"
@@ -282,13 +317,59 @@ def auto_groups(results_root: Path) -> dict[str, list[Path]]:
     return dict(groups)
 
 
+def export_tables(groups: dict[str, list[Path]], logs_root: Path, out_dir: Path, target_iter: int, require_done: bool) -> int:
+    saved = 0
+    for name in sorted(groups.keys()):
+        dirs = groups[name]
+        recs = [collect_run_records(d, logs_root, target_iter, require_done=require_done) for d in dirs]
+        non_empty = [r for r in recs if not r.empty]
+        if not non_empty:
+            print(f"Skip table (no done data): {name}")
+            continue
+        rec = pd.concat(non_empty, ignore_index=True)
+        table = summarize(rec)
+        write_table(out_dir, name, table)
+        if not table.empty:
+            saved += 1
+    return saved
+
+
+def export_plots(groups: dict[str, list[Path]], out_dir: Path, target_iter: int, require_done: bool, normalize_oracle: bool, dpi: int) -> int:
+    saved = 0
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for key in sorted(groups.keys()):
+        df, oracle = load_case_df(groups[key], target_iter=target_iter, require_done=require_done)
+        if df.empty:
+            print(f"Skip plot (no done data): {key}")
+            continue
+
+        parts = key.split("_")
+        dim = parts[0]
+        mode = parts[1]
+        clip = parts[2]
+        title = f"{dim.upper()} ({mode}) - {clip}"
+        out_path = out_dir / f"hv_{key}.png"
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        plot_case(ax, df, title, normalize_oracle, oracle)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=dpi)
+        plt.close(fig)
+
+        print(f"Saved: {out_path}")
+        saved += 1
+
+    return saved
+
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Export PAL tables (mean +/- std over replicates).")
-    ap.add_argument("--results-root", type=Path, default=Path("results"))
-    ap.add_argument("--logs-root", type=Path, default=Path("logs"))
-    ap.add_argument("--out-dir", type=Path, default=Path("results/tables"))
-    ap.add_argument("--iter", type=int, default=20, help="Iteration used for Hypervolume @N.")
+    ap = argparse.ArgumentParser(description="Generate PAL tables and plots for 2D/3D cases.")
+    ap.add_argument("--project", type=str, default=None, help="Project name under results/<project> and logs/<project>.")
+    ap.add_argument("--results-root", type=Path, default=None)
+    ap.add_argument("--logs-root", type=Path, default=None)
+    ap.add_argument("--out-dir", type=Path, default=None, help="Where to write tables/plots. Default: <results-root>/tables")
+    ap.add_argument("--iter", type=int, default=20)
     ap.add_argument(
         "--allow-incomplete",
         action=argparse.BooleanOptionalAction,
@@ -296,42 +377,44 @@ def main() -> None:
         help="Include incomplete runs/methods (default: false, i.e. done-only).",
     )
     ap.add_argument(
-        "--run-dirs",
-        nargs="*",
-        default=None,
-        help="Optional explicit run dirs (relative to results-root). If omitted, auto-build tables from 2D/3D matrix folders.",
+        "--normalize-oracle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize HV by oracle when available.",
+    )
+    ap.add_argument("--dpi", type=int, default=180)
+    ap.add_argument(
+        "--mode",
+        choices=["all", "tables", "plots"],
+        default="all",
+        help="What to generate.",
     )
     args = ap.parse_args()
 
+    if args.project:
+        results_root = args.results_root or Path("results") / args.project
+        logs_root = args.logs_root or Path("logs") / args.project
+    else:
+        results_root = args.results_root or Path("results")
+        logs_root = args.logs_root or Path("logs")
+
+    out_dir = args.out_dir or (results_root / "tables")
     require_done = not args.allow_incomplete
 
-    if args.run_dirs:
-        dirs = [p for p in expand_dirs(args.results_root, args.run_dirs) if p.exists()]
-        recs = [collect_run_records(d, args.logs_root, args.iter, require_done=require_done) for d in dirs]
-        non_empty = [r for r in recs if not r.empty]
-        if not non_empty:
-            print("No data found for --run-dirs, nothing to export.")
-            return
-        rec = pd.concat(non_empty, ignore_index=True)
-        table = summarize(rec)
-        write_table(args.out_dir, "custom_table", table)
-        return
-
-    groups = auto_groups(args.results_root)
+    groups = auto_groups(results_root)
     if not groups:
-        print("No auto-detected 2D/3D run directories found, nothing to export.")
+        print(f"No auto-detected 2D/3D case folders in: {results_root}")
         return
 
-    for name in sorted(groups.keys()):
-        dirs = groups[name]
-        recs = [collect_run_records(d, args.logs_root, args.iter, require_done=require_done) for d in dirs]
-        non_empty = [r for r in recs if not r.empty]
-        if not non_empty:
-            print(f"Skip (no done data): {name}")
-            continue
-        rec = pd.concat(non_empty, ignore_index=True)
-        table = summarize(rec)
-        write_table(args.out_dir, name, table)
+    n_tables = 0
+    n_plots = 0
+
+    if args.mode in ("all", "tables"):
+        n_tables = export_tables(groups, logs_root, out_dir, args.iter, require_done)
+    if args.mode in ("all", "plots"):
+        n_plots = export_plots(groups, out_dir, args.iter, require_done, args.normalize_oracle, args.dpi)
+
+    print(f"Done. tables={n_tables}, plots={n_plots}, out_dir={out_dir}")
 
 
 if __name__ == "__main__":

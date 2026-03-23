@@ -5,13 +5,19 @@ from .ellipse_fast import FastEllipseAcquisition
 from .random import RandomAcquisition
 from .ucb import UCBExplorationAcquisition
 from .ellipse_direction import EllipseDirectionAcquisition
+from .ucb_flexible import UCBExplorationAcquisitionFlexible
+from .ellipse_fast_flexible import FastEllipseAcquisitionFlexible
+from .ellipse_direction_flexible import EllipseDirectionAcquisitionFlexible
 
 
 REGISTRY: dict[str, type[AcquisitionFunction]] = {
     "ucb": UCBExplorationAcquisition,
+    "ucb_flexible": UCBExplorationAcquisitionFlexible,
     "random": RandomAcquisition,
     "ellipse_fast": FastEllipseAcquisition,
+    "ellipse_fast_flexible": FastEllipseAcquisitionFlexible,
     "ellipse_directions": EllipseDirectionAcquisition,
+    "ellipse_directions_flexible": EllipseDirectionAcquisitionFlexible,
 }
 
 
