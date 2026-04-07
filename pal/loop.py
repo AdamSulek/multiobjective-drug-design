@@ -11,12 +11,7 @@ import numpy as np
 from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
 from .model import build_model, mc_predict, predict_eval, train_model
-from .pareto import hypervolume_2d
-from .pareto_3D import (
-    build_dominance_index_3d,
-    hv_3d_max,
-    pareto_front_3d_max,
-)
+from .pareto import hypervolume_2d, hypervolume_3d_max_fast, pareto_front_max_3d_fast
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -45,8 +40,7 @@ def _hv(Y: np.ndarray, ref_point: tuple[float, ...]) -> float:
     if m == 2:
         return hypervolume_2d(Y, ref_point)
     if m == 3:
-        front = pareto_front_3d_max(Y)
-        return hv_3d_max(front, ref_point)
+        return hypervolume_3d_max_fast(Y, ref_point)
     raise ValueError(f"Only 2D/3D supported, got m={m}")
 
 
@@ -274,17 +268,13 @@ def run_al_loop(
 
         pareto_front = None
         hv_front = None
-        dom_index = None
 
         if n_obj == 3 and state.Y_labeled.shape[0] > 0:
-            with timed("pareto_front_3d_max(labeled)"):
-                pareto_front = pareto_front_3d_max(state.Y_labeled)
+            with timed("pareto_front_max_3d_fast(labeled)"):
+                pareto_front = pareto_front_max_3d_fast(state.Y_labeled)
 
-            with timed("hv_3d_max(front)"):
-                hv_front = hv_3d_max(pareto_front, al.ref_point)
-
-            with timed("build_dominance_index_3d(front)"):
-                dom_index = build_dominance_index_3d(pareto_front)
+            with timed("hypervolume_3d_max_fast(front)"):
+                hv_front = hypervolume_3d_max_fast(pareto_front, al.ref_point)
 
             LOGGER.info(
                 f"[PARETO] it={it} labeled={state.Y_labeled.shape[0]} "
@@ -306,8 +296,6 @@ def run_al_loop(
             }
             if "pareto_front" in select_params:
                 select_kwargs["pareto_front"] = pareto_front
-            if "pareto_dom_index" in select_params:
-                select_kwargs["pareto_dom_index"] = dom_index
             if "pareto_hv" in select_params:
                 select_kwargs["pareto_hv"] = hv_front
 

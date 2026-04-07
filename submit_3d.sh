@@ -20,22 +20,16 @@ NEGATE_MODE_LIST="${NEGATE_MODE_LIST:-two all3}"     # two | all3 | none
 STRATEGY_LIST="${STRATEGY_LIST:-random ucb ellipse_fast ellipse_directions}"
 
 # ===== Runtime/resources =====
-MEM_PER_JOB="${MEM_PER_JOB:-260G}"
-TIME_MODE="${TIME_MODE:-auto}"                        # auto | fixed
-TIME_LIMIT="${TIME_LIMIT:-06:00:00}"
-TIME_RANDOM="${TIME_RANDOM:-02:00:00}"
-TIME_UCB="${TIME_UCB:-12:00:00}"
-TIME_ELLIPSE_FAST="${TIME_ELLIPSE_FAST:-06:00:00}"
-TIME_ELLIPSE_DIRECTIONS="${TIME_ELLIPSE_DIRECTIONS:-01:00:00}"
-
-CPUS_PER_TASK="${CPUS_PER_TASK:-64}"
-PARTITION="${PARTITION:-plgrid-gpu-gh200}"
-ACCOUNT="${ACCOUNT:-plgsonata19-gpu-gh200}"
-GRES="${GRES:-gpu:1}"
+# Runtime hints retained for compatibility with old command examples.
+TIME_MODE="${TIME_MODE:-auto}"                        # ignored by nohup mode
+TIME_LIMIT="${TIME_LIMIT:-06:00:00}"                 # ignored by nohup mode
+TIME_RANDOM="${TIME_RANDOM:-02:00:00}"               # ignored by nohup mode
+TIME_UCB="${TIME_UCB:-12:00:00}"                     # ignored by nohup mode
+TIME_ELLIPSE_FAST="${TIME_ELLIPSE_FAST:-06:00:00}"   # ignored by nohup mode
+TIME_ELLIPSE_DIRECTIONS="${TIME_ELLIPSE_DIRECTIONS:-01:00:00}"  # ignored by nohup mode
 
 # ===== Environment/data =====
-CONDA_INIT="${CONDA_INIT:-/net/storage/pr3/plgrid/plggsanodrugs/miniconda-arm/bin/activate}"
-CONDA_ENV="${CONDA_ENV:-savi-arm}"
+CONDA_ENV="${CONDA_ENV:-conda_gpu}"
 
 # PROPERTY_COLS controls selected objectives; NEGATE_MODE chooses which of them are negated.
 DATA_FILE="${DATA_FILE:-data/3D/savi_3D_wo_X.parquet}"
@@ -51,8 +45,30 @@ BATCH_SIZE="${BATCH_SIZE:-100}"
 N_ITERATIONS="${N_ITERATIONS:-20}"
 UCB_INCLUDE_K0="${UCB_INCLUDE_K0:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+MAX_PARALLEL="${MAX_PARALLEL:-1}"
+WAIT_SECONDS="${WAIT_SECONDS:-2}"
 
 mkdir -p "$LOG_ROOT" "$OUTPUT_ROOT"
+
+if ! command -v conda >/dev/null 2>&1; then
+  echo "conda command not found in PATH"
+  exit 1
+fi
+
+if ! [[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_PARALLEL must be a positive integer. Got: $MAX_PARALLEL"
+  exit 1
+fi
+
+wait_for_slot() {
+  while true; do
+    running_jobs=$(jobs -pr | wc -l | tr -d '[:space:]')
+    if (( running_jobs < MAX_PARALLEL )); then
+      break
+    fi
+    sleep "$WAIT_SECONDS"
+  done
+}
 
 seed_items=()
 if [[ "$SEED_MODE" == "multi" ]]; then
@@ -74,21 +90,6 @@ fi
 for ZERO_HV in $ZERO_HV_LIST; do
   for NEGATE_MODE in $NEGATE_MODE_LIST; do
     for STRATEGY in $STRATEGY_LIST; do
-      if [[ "$TIME_MODE" == "fixed" ]]; then
-        TIME_LIMIT_RUN="$TIME_LIMIT"
-      else
-        case "$STRATEGY" in
-          random) TIME_LIMIT_RUN="$TIME_RANDOM" ;;
-          ucb) TIME_LIMIT_RUN="$TIME_UCB" ;;
-          ellipse_fast) TIME_LIMIT_RUN="$TIME_ELLIPSE_FAST" ;;
-          ellipse_directions) TIME_LIMIT_RUN="$TIME_ELLIPSE_DIRECTIONS" ;;
-          *)
-            echo "Unsupported STRATEGY=$STRATEGY"
-            exit 1
-            ;;
-        esac
-      fi
-
       for item in "${seed_items[@]}"; do
         SEED_FILE_RUN="${item%%:*}"
         REP_TAG_RUN="${item##*:}"
@@ -121,43 +122,45 @@ for ZERO_HV in $ZERO_HV_LIST; do
           UCB_K0_ARG="--ucb_include_k0"
         fi
 
-        WRAP_CMD=$(cat <<EOC
-source "$CONDA_INIT"
-conda activate "$CONDA_ENV"
-python -u -m pal.compare_flexible \
-  --data_file "$DATA_FILE" \
-  --x_npy "$X_NPY" \
-  --property_cols $PROPERTY_COLS \
-  $NEGATE_ARGS \
-  --strategies "$STRATEGY" \
-  --k_list $K_LIST \
-  $ZERO_ARG \
-  --seed_size "$SEED_SIZE" \
-  --batch_size "$BATCH_SIZE" \
-  --n_iterations "$N_ITERATIONS" \
-  --n_replicates "$N_REPLICATES" \
-  --seed_indices_file "$SEED_FILE_RUN" \
-  --global_pareto_file "$GLOBAL_PARETO_FILE" \
-  --device "$DEVICE" \
-  $UCB_K0_ARG \
-  $EXTRA_ARGS \
-  --output_dir "$OUTDIR" \
-  > "$OUT_LOG" 2>&1
-EOC
-)
+        CMD=(conda run --no-capture-output -n "$CONDA_ENV" python -u -m src.train
+          --data_file "$DATA_FILE"
+          --x_npy "$X_NPY"
+          --property_cols $PROPERTY_COLS
+          --strategies "$STRATEGY"
+          --k_list $K_LIST
+          $ZERO_ARG
+          --seed_size "$SEED_SIZE"
+          --batch_size "$BATCH_SIZE"
+          --n_iterations "$N_ITERATIONS"
+          --n_replicates "$N_REPLICATES"
+          --seed_indices_file "$SEED_FILE_RUN"
+          --global_pareto_file "$GLOBAL_PARETO_FILE"
+          --device "$DEVICE"
+          --output_dir "$OUTDIR"
+        )
 
-        sbatch \
-          --job-name="$JOB_TAG" \
-          --cpus-per-task="$CPUS_PER_TASK" \
-          --time="$TIME_LIMIT_RUN" \
-          --partition="$PARTITION" \
-          --gres="$GRES" \
-          -A "$ACCOUNT" \
-          --mem="$MEM_PER_JOB" \
-          --output="${LOG_ROOT}/${JOB_TAG}_%j.out" \
-          --error="${LOG_ROOT}/${JOB_TAG}_%j.err" \
-          --wrap "$WRAP_CMD"
+        if [[ -n "$NEGATE_ARGS" ]]; then
+          read -r -a NEGATE_ARR <<< "$NEGATE_ARGS"
+          CMD+=("${NEGATE_ARR[@]}")
+        fi
+
+        if [[ -n "$UCB_K0_ARG" ]]; then
+          CMD+=(--ucb_include_k0)
+        fi
+
+        if [[ -n "$EXTRA_ARGS" ]]; then
+          read -r -a EXTRA_ARR <<< "$EXTRA_ARGS"
+          CMD+=("${EXTRA_ARR[@]}")
+        fi
+
+        wait_for_slot
+        nohup "${CMD[@]}" > "$OUT_LOG" 2>&1 &
+        PID=$!
+        echo "$PID" > "${LOG_ROOT}/${JOB_TAG}.pid"
+        echo "Started $JOB_TAG pid=$PID log=$OUT_LOG"
       done
     done
   done
 done
+
+wait
