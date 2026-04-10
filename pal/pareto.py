@@ -15,9 +15,24 @@ Conventions:
 
 from __future__ import annotations
 
+import logging
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
 from typing import Tuple
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+# Parallel batch_delta_hv_3d: max worker processes (coarse chunks, not one task per row).
+_BATCH_DELTA_HV_3D_MAX_WORKERS = max(
+    1, int(os.environ.get("BATCH_DELTA_HV_3D_WORKERS", "20"))
+)
+# Minimum candidates per chunk target; fewer chunks => coarser grain.
+_BATCH_DELTA_HV_3D_MIN_PER_CHUNK = max(
+    1, int(os.environ.get("BATCH_DELTA_HV_3D_MIN_PER_CHUNK", "50"))
+)
 
 # -----------------------------
 # Pareto (MAX): keep nondominated
@@ -581,6 +596,45 @@ def _gap_volume_3d(front_nd: np.ndarray, p: np.ndarray, ref: Tuple[float, float,
     return float(np.min(gaps))
 
 
+def _delta_hv_3d_dense_block(
+    F_nd: np.ndarray,
+    hv_old: float,
+    cands: np.ndarray,
+    ref: Tuple[float, float, float],
+    compute_negative: bool,
+) -> np.ndarray:
+    """Per-candidate ΔHV for rows of *cands*; same math as the original batch_delta_hv_3d loop."""
+    rx, ry, rz = float(ref[0]), float(ref[1]), float(ref[2])
+    cands = np.asarray(cands, dtype=float).reshape(-1, 3)
+    B = len(cands)
+    out = np.zeros(B, dtype=float)
+    for i in range(B):
+        p = cands[i]
+        if not np.isfinite(p).all():
+            out[i] = 0.0
+            continue
+
+        hv_new = hypervolume_3d(np.vstack([F_nd, p]) if len(F_nd) else np.array([p]), (rx, ry, rz))
+        delta = hv_new - hv_old
+
+        if delta > 0.0:
+            out[i] = float(delta)
+        elif compute_negative:
+            gap = _gap_volume_3d(F_nd, p, (rx, ry, rz))
+            out[i] = -float(gap)
+        else:
+            out[i] = 0.0
+    return out
+
+
+def _batch_delta_hv_3d_process_chunk(
+    payload: tuple[np.ndarray, float, np.ndarray, tuple[float, float, float], bool],
+) -> np.ndarray:
+    """Picklable entry point for ProcessPoolExecutor (must be top-level)."""
+    F_nd, hv_old, cands_chunk, ref, compute_negative = payload
+    return _delta_hv_3d_dense_block(F_nd, hv_old, cands_chunk, ref, compute_negative)
+
+
 def batch_delta_hv_3d(
     front: np.ndarray,
     candidates: np.ndarray,
@@ -601,6 +655,11 @@ def batch_delta_hv_3d(
       For front size ~70 it's correct and usually acceptable.
       If you need faster later, we'll add a specialized 3D delta algorithm.
 
+    Parallelism (optional): when ``B`` is large enough, splits candidates into coarse
+    chunks and runs ``_delta_hv_3d_dense_block`` in worker processes. Disable with
+    ``BATCH_DELTA_HV_3D_PARALLEL=0``. Tune with ``BATCH_DELTA_HV_3D_WORKERS`` (default 20)
+    and ``BATCH_DELTA_HV_3D_MIN_PER_CHUNK`` (default 50).
+
     Inputs:
       front: (M,3) current labeled points OR already ND set (either ok)
       candidates: (B,3)
@@ -620,27 +679,57 @@ def batch_delta_hv_3d(
 
     hv_old = hypervolume_3d(F_nd, (rx, ry, rz)) if len(F_nd) else 0.0
 
-    out = np.zeros(B, dtype=float)
+    parallel_env = os.environ.get("BATCH_DELTA_HV_3D_PARALLEL", "1").strip().lower()
+    use_parallel = parallel_env not in ("0", "false", "no")
 
-    for i in range(B):
-        p = cands[i]
-        if not np.isfinite(p).all():
-            out[i] = 0.0
-            continue
+    n_chunks = min(
+        _BATCH_DELTA_HV_3D_MAX_WORKERS,
+        max(1, (B + _BATCH_DELTA_HV_3D_MIN_PER_CHUNK - 1) // _BATCH_DELTA_HV_3D_MIN_PER_CHUNK),
+    )
 
-        # Exact ΔHV
-        hv_new = hypervolume_3d(np.vstack([F_nd, p]) if len(F_nd) else np.array([p]), (rx, ry, rz))
-        delta = hv_new - hv_old
+    if not use_parallel or n_chunks <= 1:
+        t0 = time.perf_counter()
+        out = _delta_hv_3d_dense_block(F_nd, hv_old, cands, (rx, ry, rz), compute_negative)
+        t_serial = time.perf_counter() - t0
+        logger.info(
+            "[TIMER] batch_delta_hv_3d mode=serial total_s=%.6f B=%d F_nd=%d",
+            t_serial,
+            B,
+            len(F_nd),
+        )
+        return out
 
-        if delta > 0.0:
-            out[i] = float(delta)
-        elif compute_negative:
-            # Option B: negative "gap volume" under the front
-            gap = _gap_volume_3d(F_nd, p, (rx, ry, rz))
-            out[i] = -float(gap)
-        else:
-            out[i] = 0.0
+    t_dispatch0 = time.perf_counter()
+    chunks = np.array_split(cands, n_chunks)
+    packs = [
+        (F_nd, hv_old, np.ascontiguousarray(ch, dtype=float), (rx, ry, rz), compute_negative)
+        for ch in chunks
+    ]
+    t_after_build = time.perf_counter()
+    dispatch_build_s = t_after_build - t_dispatch0
 
+    pool_workers = min(_BATCH_DELTA_HV_3D_MAX_WORKERS, n_chunks)
+    t_pool0 = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=pool_workers) as ex:
+        results = list(ex.map(_batch_delta_hv_3d_process_chunk, packs))
+    t_pool1 = time.perf_counter()
+    pool_wall_s = t_pool1 - t_pool0
+
+    t_merge0 = time.perf_counter()
+    out = np.concatenate(results, axis=0)
+    merge_s = time.perf_counter() - t_merge0
+
+    logger.info(
+        "[TIMER] batch_delta_hv_3d mode=parallel pool_wall_s=%.6f B=%d n_chunks=%d pool_workers=%d "
+        "F_nd=%d dispatch_build_packs_s=%.6f merge_concat_s=%.6f",
+        pool_wall_s,
+        B,
+        n_chunks,
+        pool_workers,
+        len(F_nd),
+        dispatch_build_s,
+        merge_s,
+    )
     return out
 
 
