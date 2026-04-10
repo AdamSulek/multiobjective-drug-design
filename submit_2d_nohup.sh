@@ -17,7 +17,7 @@ N_REPLICATES="${N_REPLICATES:-1}"
 # ===== Experiment matrix =====
 ZERO_HV_LIST="${ZERO_HV_LIST:-0 1}"
 NEGATE_MODE_LIST="${NEGATE_MODE_LIST:-both}"         # both | none
-STRATEGY_LIST="${STRATEGY_LIST:-random}"
+STRATEGY_LIST="${STRATEGY_LIST:-random ucb ellipse_fast ellipse_directions}"
 
 # ===== Environment/data =====
 CONDA_ENV="${CONDA_ENV:-savi_gpu}"
@@ -36,6 +36,10 @@ UCB_INCLUDE_K0="${UCB_INCLUDE_K0:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 MAX_PARALLEL="${MAX_PARALLEL:-1}"
 WAIT_SECONDS="${WAIT_SECONDS:-2}"
+WANDB_ENABLE="${WANDB_ENABLE:-0}"                    # 0 | 1
+WANDB_PROJECT="${WANDB_PROJECT:-}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_RUN_NAME_PREFIX="${WANDB_RUN_NAME_PREFIX:-}"
 
 mkdir -p "$LOG_ROOT" "$OUTPUT_ROOT"
 
@@ -49,10 +53,23 @@ if ! [[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+active_pids=()
+
+reap_finished_pids() {
+  local alive=()
+  local pid
+  for pid in "${active_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    fi
+  done
+  active_pids=("${alive[@]}")
+}
+
 wait_for_slot() {
   while true; do
-    running_jobs=$(jobs -pr | wc -l | tr -d '[:space:]')
-    if (( running_jobs < MAX_PARALLEL )); then
+    reap_finished_pids
+    if (( ${#active_pids[@]} < MAX_PARALLEL )); then
       break
     fi
     sleep "$WAIT_SECONDS"
@@ -143,9 +160,25 @@ for ZERO_HV in $ZERO_HV_LIST; do
           CMD+=("${EXTRA_ARR[@]}")
         fi
 
+        if [[ "$WANDB_ENABLE" == "1" ]]; then
+          CMD+=(--wandb)
+          if [[ -n "$WANDB_PROJECT" ]]; then
+            CMD+=(--wandb_project "$WANDB_PROJECT")
+          fi
+          if [[ -n "$WANDB_ENTITY" ]]; then
+            CMD+=(--wandb_entity "$WANDB_ENTITY")
+          fi
+          if [[ -n "$WANDB_RUN_NAME_PREFIX" ]]; then
+            CMD+=(--wandb_run_name "${WANDB_RUN_NAME_PREFIX}_${JOB_TAG}")
+          else
+            CMD+=(--wandb_run_name "$JOB_TAG")
+          fi
+        fi
+
         wait_for_slot
         nohup "${CMD[@]}" > "$OUT_LOG" 2>&1 &
         PID=$!
+        active_pids+=("$PID")
         echo "$PID" > "${LOG_ROOT}/${JOB_TAG}.pid"
         echo "Started $JOB_TAG pid=$PID log=$OUT_LOG"
       done

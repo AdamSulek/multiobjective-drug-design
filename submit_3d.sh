@@ -34,8 +34,8 @@ ACCOUNT="${ACCOUNT:-plgsonata19-gpu-gh200}"
 GRES="${GRES:-gpu:1}"
 
 # ===== Environment/data =====
-CONDA_INIT="${CONDA_INIT:-/net/storage/pr3/plgrid/plggsanodrugs/miniconda/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-savi}"
+CONDA_INIT="${CONDA_INIT:-/net/storage/pr3/plgrid/plggsanodrugs/miniconda-arm/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-savi-arm}"
 
 # PROPERTY_COLS controls selected objectives; NEGATE_MODE chooses which of them are negated.
 DATA_FILE="${DATA_FILE:-data/3D/savi_3D_wo_X.parquet}"
@@ -54,9 +54,10 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # ===== W&B =====
 WANDB_ENABLE="${WANDB_ENABLE:-0}"                    # 0 | 1
-WANDB_PROJECT="${WANDB_PROJECT:-multiobjective-drug-design}"
-WANDB_ENTITY="${WANDB_ENTITY:-}"
-WANDB_RUN_NAME_PREFIX="${WANDB_RUN_NAME_PREFIX:-}"
+WANDB_PROJECT="${WANDB_PROJECT:-mdg-helios-3d}"
+WANDB_ENTITY="${WANDB_ENTITY:-jklimczak-sano}"
+WANDB_RUN_NAME_PREFIX="${WANDB_RUN_NAME_PREFIX:-3d}"
+export WANDB_API_KEY="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"
 
 mkdir -p "$LOG_ROOT" "$OUTPUT_ROOT"
 

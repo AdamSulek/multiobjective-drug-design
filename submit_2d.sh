@@ -5,7 +5,7 @@ set -euo pipefail
 SEED_MODE="${SEED_MODE:-multi}"                       # multi | single
 SEED_FILE_LIST="${SEED_FILE_LIST:-seeds/rep0.txt seeds/rep1.txt seeds/rep2.txt}"
 SEED_FILE_SINGLE="${SEED_FILE_SINGLE:-seeds/rep0.txt}"
-PROJECT="${PROJECT:-default}"
+PROJECT="${PROJECT:-default_2d}"
 RESULTS_BASE="${RESULTS_BASE:-results/$PROJECT}"
 LOGS_BASE="${LOGS_BASE:-logs/$PROJECT}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$RESULTS_BASE}"
@@ -17,10 +17,11 @@ N_REPLICATES="${N_REPLICATES:-1}"
 # ===== Experiment matrix =====
 ZERO_HV_LIST="${ZERO_HV_LIST:-0 1}"
 NEGATE_MODE_LIST="${NEGATE_MODE_LIST:-both}"         # both | none
-STRATEGY_LIST="${STRATEGY_LIST:-random}"
+#STRATEGY_LIST="${STRATEGY_LIST:-random ucb ellipse_fast ellipse_directions}"
+STRATEGY_LIST="${STRATEGY_LIST:-ellipse_fast}"
 
 # ===== Runtime/resources =====
-TIME_LIMIT="${TIME_LIMIT:-12:00:00}"
+TIME_LIMIT="${TIME_LIMIT:-02:00:00}"
 MEM_PER_JOB="${MEM_PER_JOB:-220G}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-64}"
 PARTITION="${PARTITION:-plgrid-gpu-gh200}"
@@ -28,8 +29,8 @@ ACCOUNT="${ACCOUNT:-plgsonata19-gpu-gh200}"
 GRES="${GRES:-gpu:1}"
 
 # ===== Environment/data =====
-CONDA_INIT="${CONDA_INIT:-/net/storage/pr3/plgrid/plggsanodrugs/miniconda/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-savi}"
+CONDA_INIT="${CONDA_INIT:-/net/storage/pr3/plgrid/plggsanodrugs/miniconda-arm/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-savi-arm}"
 
 DATA_FILE="${DATA_FILE:-data/savi_data.parquet}"
 PROPERTY_COLS="${PROPERTY_COLS:-score_3GVB score_6D6P}"
@@ -45,10 +46,11 @@ UCB_INCLUDE_K0="${UCB_INCLUDE_K0:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # ===== W&B =====
-WANDB_ENABLE="${WANDB_ENABLE:-0}"                    # 0 | 1
-WANDB_PROJECT="${WANDB_PROJECT:-multiobjective-drug-design}"
-WANDB_ENTITY="${WANDB_ENTITY:-}"
-WANDB_RUN_NAME_PREFIX="${WANDB_RUN_NAME_PREFIX:-}"
+WANDB_ENABLE="${WANDB_ENABLE:-1}"                    # 0 | 1
+WANDB_PROJECT="${WANDB_PROJECT:-mdg-helios-2d}"
+WANDB_ENTITY="${WANDB_ENTITY:-jklimczak-sano}"
+WANDB_RUN_NAME_PREFIX="${WANDB_RUN_NAME_PREFIX:-2d}"
+export WANDB_API_KEY="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"
 
 mkdir -p "$LOG_ROOT" "$OUTPUT_ROOT"
 
