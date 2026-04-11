@@ -113,6 +113,7 @@ def _predict_unlabeled(
                 model,
                 X_unlabeled,
                 n_passes=mcfg.mc_passes,
+                batch_size=mcfg.mc_predict_batch_size,
                 device=device,
             )
         t_pred_unlabeled = time.perf_counter() - t0
@@ -124,7 +125,12 @@ def _predict_unlabeled(
 
     t0 = time.perf_counter()
     with timed("predict_eval(unlabeled, no-uncertainty)"):
-        means = predict_eval(model, X_unlabeled, device=device)
+        means = predict_eval(
+            model,
+            X_unlabeled,
+            batch_size=mcfg.predict_eval_batch_size,
+            device=device,
+        )
     t_pred_unlabeled = time.perf_counter() - t0
 
     means = means * y_std + y_mean
@@ -233,18 +239,33 @@ def run_al_loop(
                 val_fraction=mcfg.val_fraction,
                 lr_scheduler_patience=mcfg.lr_scheduler_patience,
                 lr_scheduler_factor=mcfg.lr_scheduler_factor,
+                num_workers=mcfg.num_workers,
             )
         t_train = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         with timed("predict_eval(train)"):
-            Y_train_pred = predict_eval(model, X_train, device=config.device)
+            Y_train_pred = predict_eval(
+                model,
+                X_train,
+                batch_size=mcfg.predict_eval_batch_size,
+                device=config.device,
+            )
         t_pred_train = time.perf_counter() - t0
         Y_train_pred = Y_train_pred * Y_std + Y_mean
         train_m = compute_regression_metrics(Y_train, Y_train_pred)
         state.train_metrics.append(train_m)
 
+        t_xu0 = time.perf_counter()
         X_unlabeled = X_pool[state.unlabeled_indices]
+        t_xu = time.perf_counter() - t_xu0
+        _d_feat = int(X_unlabeled.shape[1]) if getattr(X_unlabeled, "ndim", 0) >= 2 else -1
+        LOGGER.info(
+            "[TIMER] X_pool[unlabeled_indices] materialize: %.3fs U=%d D=%d",
+            t_xu,
+            len(state.unlabeled_indices),
+            _d_feat,
+        )
 
         needs_cov = getattr(acq_fn, "needs_full_cov", False)
         needs_uncertainty = getattr(acq_fn, "needs_uncertainty", True)
@@ -264,6 +285,12 @@ def run_al_loop(
             needs_uncertainty=needs_uncertainty,
             y_mean=Y_mean,
             y_std=Y_std,
+        )
+        LOGGER.info(
+            "[GPU_INFER] unlabeled U=%d device=%s pred_unlab_s=%.3f",
+            len(state.unlabeled_indices),
+            config.device,
+            t_pred_unlabeled,
         )
 
         pareto_front = None

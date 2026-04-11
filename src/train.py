@@ -134,6 +134,24 @@ def _load_pool_data(args: argparse.Namespace, config: ExperimentConfig) -> tuple
     return df, X_pool, Y_pool
 
 
+def _log_train_infer_stage_totals(results: dict[str, Any], logger: logging.Logger) -> None:
+    """Aggregate GPU-side training and prediction times from each AL iteration."""
+    for strategy_key, result in results.items():
+        for rep_idx, state in enumerate(result.states):
+            rows = getattr(state, "iter_stage_times", [])
+            tr = sum(float(r.get("train", 0.0)) for r in rows)
+            pt = sum(float(r.get("pred_train", 0.0)) for r in rows)
+            pu = sum(float(r.get("pred_unlab", 0.0)) for r in rows)
+            logger.info(
+                "[TIME_SUMMARY_GPU] key=%s rep=%d sum_train_s=%.3f sum_pred_train_s=%.3f sum_pred_unlab_s=%.3f",
+                strategy_key,
+                rep_idx,
+                tr,
+                pt,
+                pu,
+            )
+
+
 def _log_global_timing_summary(results: dict[str, Any], logger: logging.Logger) -> None:
     for strategy_key, result in results.items():
         rep_totals = []
@@ -185,10 +203,34 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=10)
     p.add_argument("--seed_indices_file", type=str, default=None)
     p.add_argument("--epochs", type=int, default=200)
+    p.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=256,
+        help="PyTorch batch size for MLP training (not acquisition batch).",
+    )
+    p.add_argument(
+        "--predict_eval_batch_size",
+        type=int,
+        default=4096,
+        help="Batch size for predict_eval (labeled + unlabeled pool inference).",
+    )
+    p.add_argument(
+        "--mc_predict_batch_size",
+        type=int,
+        default=4096,
+        help="Batch size for MC-dropout inference (uncertainty / covariance path).",
+    )
     p.add_argument("--mc_passes", type=int, default=50)
     p.add_argument("--n_replicates", type=int, default=1)
     p.add_argument("--output_dir", type=str, default="pal_results")
     p.add_argument("--device", type=str, default="cpu")
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=-1,
+        help="PyTorch DataLoader workers; -1 = auto from --device (8 if CUDA device string, else 0).",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val_every", type=int, default=1)
     p.add_argument("--patience", type=int, default=20)
@@ -295,6 +337,9 @@ def main() -> None:
     config.al.batch_size = args.batch_size
     config.al.val_every = args.val_every
     config.model.epochs = args.epochs
+    config.model.batch_size = int(args.train_batch_size)
+    config.model.predict_eval_batch_size = int(args.predict_eval_batch_size)
+    config.model.mc_predict_batch_size = int(args.mc_predict_batch_size)
     config.model.mc_passes = args.mc_passes
     config.model.patience = args.patience
     config.model.min_epochs = args.min_epochs
@@ -303,9 +348,24 @@ def main() -> None:
     config.model.hidden_sizes = tuple(args.hidden_sizes)
     config.output_dir = args.output_dir
     config.device = args.device
+    if int(args.num_workers) < 0:
+        nw = 8 if str(config.device).startswith("cuda") else 0
+        logger.info(f"DataLoader num_workers={nw} (auto from device={config.device})")
+    else:
+        nw = max(0, int(args.num_workers))
+        logger.info(f"DataLoader num_workers={nw} (from --num_workers)")
+    config.model.num_workers = nw
     os.makedirs(args.output_dir, exist_ok=True)
 
+    t_pool = time.perf_counter()
     df, X_pool, Y_pool = _load_pool_data(args, config)
+    logger.info(
+        "[TIMER] pool_load: %.3fs N=%d n_obj=%d x_mmap=%s",
+        time.perf_counter() - t_pool,
+        len(Y_pool),
+        int(Y_pool.shape[1]),
+        isinstance(X_pool, np.memmap),
+    )
     n_obj = int(Y_pool.shape[1])
     if n_obj not in (2, 3):
         raise ValueError(f"Only 2D/3D objectives are supported, got {n_obj}")
@@ -354,6 +414,7 @@ def main() -> None:
         load_seed_indices_fn=load_seed_indices,
     )
     logger.info(f"[TIME] run_loop_matrix total={time.perf_counter() - t_run:.3f}s")
+    _log_train_infer_stage_totals(loop_out.results, logger)
 
     save_iteration_selections(
         results=loop_out.results,

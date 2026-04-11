@@ -15,24 +15,52 @@ Conventions:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
+from multiprocessing.shared_memory import SharedMemory
 from typing import Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Parallel batch_delta_hv_3d: max worker processes (coarse chunks, not one task per row).
+# Parallel batch_delta_hv_3d: defaults (overridden per-call from os.environ).
 _BATCH_DELTA_HV_3D_MAX_WORKERS = max(
     1, int(os.environ.get("BATCH_DELTA_HV_3D_WORKERS", "20"))
 )
-# Minimum candidates per chunk target; fewer chunks => coarser grain.
 _BATCH_DELTA_HV_3D_MIN_PER_CHUNK = max(
     1, int(os.environ.get("BATCH_DELTA_HV_3D_MIN_PER_CHUNK", "50"))
 )
+
+# Persistent process pool for batch_delta_hv_3d (reused across calls).
+_delta_hv_executor: ProcessPoolExecutor | None = None
+_delta_hv_executor_workers: int | None = None
+
+
+def shutdown_batch_delta_hv_executor() -> None:
+    """Shut down the persistent ProcessPoolExecutor (e.g. before changing BATCH_DELTA_HV_3D_WORKERS)."""
+    global _delta_hv_executor, _delta_hv_executor_workers
+    if _delta_hv_executor is not None:
+        _delta_hv_executor.shutdown(wait=True)
+        _delta_hv_executor = None
+        _delta_hv_executor_workers = None
+
+
+def _get_batch_delta_hv_executor(max_workers: int) -> ProcessPoolExecutor:
+    global _delta_hv_executor, _delta_hv_executor_workers
+    mw = max(1, int(max_workers))
+    if _delta_hv_executor is not None and _delta_hv_executor_workers != mw:
+        shutdown_batch_delta_hv_executor()
+    if _delta_hv_executor is None:
+        _delta_hv_executor = ProcessPoolExecutor(max_workers=mw)
+        _delta_hv_executor_workers = mw
+    return _delta_hv_executor
+
+
+atexit.register(shutdown_batch_delta_hv_executor)
 
 # -----------------------------
 # Pareto (MAX): keep nondominated
@@ -603,24 +631,51 @@ def _delta_hv_3d_dense_block(
     ref: Tuple[float, float, float],
     compute_negative: bool,
 ) -> np.ndarray:
-    """Per-candidate ΔHV for rows of *cands*; same math as the original batch_delta_hv_3d loop."""
+    """Per-candidate ΔHV for rows of *cands*; same math as the original batch_delta_hv_3d loop.
+
+    Reuses one (Lf+1)x3 buffer for ``F_nd ∪ {p}`` per chunk: copy *F_nd* once, only update the
+    last row each candidate (avoids repeated ``np.vstack`` / temporary allocations).
+    """
     rx, ry, rz = float(ref[0]), float(ref[1]), float(ref[2])
-    cands = np.asarray(cands, dtype=float).reshape(-1, 3)
+    cands = np.asarray(cands, dtype=np.float64).reshape(-1, 3)
     B = len(cands)
-    out = np.zeros(B, dtype=float)
+    out = np.zeros(B, dtype=np.float64)
+    F_use = np.asarray(F_nd, dtype=np.float64)
+    Lf = int(F_use.shape[0])
+
+    if Lf == 0:
+        buf = np.empty((1, 3), dtype=np.float64)
+        for i in range(B):
+            p = cands[i]
+            if not np.isfinite(p).all():
+                out[i] = 0.0
+                continue
+            buf[0, :] = p
+            hv_new = hypervolume_3d(buf, (rx, ry, rz))
+            delta = hv_new - hv_old
+            if delta > 0.0:
+                out[i] = float(delta)
+            elif compute_negative:
+                gap = _gap_volume_3d(F_use, p, (rx, ry, rz))
+                out[i] = -float(gap)
+            else:
+                out[i] = 0.0
+        return out
+
+    buf = np.empty((Lf + 1, 3), dtype=np.float64)
+    buf[:Lf, :] = F_use
     for i in range(B):
         p = cands[i]
         if not np.isfinite(p).all():
             out[i] = 0.0
             continue
-
-        hv_new = hypervolume_3d(np.vstack([F_nd, p]) if len(F_nd) else np.array([p]), (rx, ry, rz))
+        buf[Lf, :] = p
+        hv_new = hypervolume_3d(buf, (rx, ry, rz))
         delta = hv_new - hv_old
-
         if delta > 0.0:
             out[i] = float(delta)
         elif compute_negative:
-            gap = _gap_volume_3d(F_nd, p, (rx, ry, rz))
+            gap = _gap_volume_3d(F_use, p, (rx, ry, rz))
             out[i] = -float(gap)
         else:
             out[i] = 0.0
@@ -630,9 +685,39 @@ def _delta_hv_3d_dense_block(
 def _batch_delta_hv_3d_process_chunk(
     payload: tuple[np.ndarray, float, np.ndarray, tuple[float, float, float], bool],
 ) -> np.ndarray:
-    """Picklable entry point for ProcessPoolExecutor (must be top-level)."""
+    """Picklable entry point for ProcessPoolExecutor (pickled chunks; fallback path)."""
     F_nd, hv_old, cands_chunk, ref, compute_negative = payload
     return _delta_hv_3d_dense_block(F_nd, hv_old, cands_chunk, ref, compute_negative)
+
+
+def _batch_delta_hv_3d_shm_worker(
+    spec: tuple[
+        str,
+        tuple[int, int],
+        str,
+        tuple[int, int],
+        int,
+        int,
+        float,
+        float,
+        float,
+        float,
+        bool,
+    ],
+) -> np.ndarray:
+    """Worker: read *F_nd* and candidate slab from SharedMemory by name; small *spec* pickle only."""
+    shm_f_name, f_shape, shm_c_name, c_shape, i0, i1, hv_old, rx, ry, rz, compute_neg = spec
+    ref = (rx, ry, rz)
+    shm_f = SharedMemory(name=shm_f_name)
+    shm_c = SharedMemory(name=shm_c_name)
+    try:
+        F_nd = np.ndarray(f_shape, dtype=np.float64, buffer=shm_f.buf)
+        c_all = np.ndarray(c_shape, dtype=np.float64, buffer=shm_c.buf)
+        chunk_v = c_all[i0:i1]
+        return _delta_hv_3d_dense_block(F_nd, hv_old, chunk_v, ref, compute_neg)
+    finally:
+        shm_f.close()
+        shm_c.close()
 
 
 def batch_delta_hv_3d(
@@ -655,10 +740,11 @@ def batch_delta_hv_3d(
       For front size ~70 it's correct and usually acceptable.
       If you need faster later, we'll add a specialized 3D delta algorithm.
 
-    Parallelism (optional): when ``B`` is large enough, splits candidates into coarse
-    chunks and runs ``_delta_hv_3d_dense_block`` in worker processes. Disable with
-    ``BATCH_DELTA_HV_3D_PARALLEL=0``. Tune with ``BATCH_DELTA_HV_3D_WORKERS`` (default 20)
-    and ``BATCH_DELTA_HV_3D_MIN_PER_CHUNK`` (default 50).
+    Parallelism (optional): reuses a **persistent** ``ProcessPoolExecutor``. Candidates and
+    ``F_nd`` are placed in **SharedMemory** so workers only receive small index specs (see
+    ``BATCH_DELTA_HV_3D_USE_SHM``). Disable parallel with ``BATCH_DELTA_HV_3D_PARALLEL=0``.
+    Tune ``BATCH_DELTA_HV_3D_WORKERS`` and ``BATCH_DELTA_HV_3D_MIN_PER_CHUNK``.
+    Call ``shutdown_batch_delta_hv_executor()`` after changing worker count in-process.
 
     Inputs:
       front: (M,3) current labeled points OR already ND set (either ok)
@@ -667,24 +753,32 @@ def batch_delta_hv_3d(
     """
     rx, ry, rz = float(ref[0]), float(ref[1]), float(ref[2])
 
-    cands = np.asarray(candidates, dtype=float).reshape(-1, 3)
+    cands = np.asarray(candidates, dtype=np.float64).reshape(-1, 3)
     B = len(cands)
     if B == 0:
         return np.empty(0, dtype=float)
 
     # Ensure front is ND and finite
-    F = np.asarray(front, dtype=float).reshape(-1, 3)
+    F = np.asarray(front, dtype=np.float64).reshape(-1, 3)
     F = F[np.isfinite(F).all(axis=1)]
-    F_nd = pareto_front(F) if len(F) else np.empty((0, 3), dtype=float)
+    F_nd = pareto_front(F) if len(F) else np.empty((0, 3), dtype=np.float64)
 
     hv_old = hypervolume_3d(F_nd, (rx, ry, rz)) if len(F_nd) else 0.0
+
+    max_workers = max(1, int(os.environ.get("BATCH_DELTA_HV_3D_WORKERS", "20")))
+    min_per_chunk = max(1, int(os.environ.get("BATCH_DELTA_HV_3D_MIN_PER_CHUNK", "50")))
+    use_shm = os.environ.get("BATCH_DELTA_HV_3D_USE_SHM", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
 
     parallel_env = os.environ.get("BATCH_DELTA_HV_3D_PARALLEL", "1").strip().lower()
     use_parallel = parallel_env not in ("0", "false", "no")
 
     n_chunks = min(
-        _BATCH_DELTA_HV_3D_MAX_WORKERS,
-        max(1, (B + _BATCH_DELTA_HV_3D_MIN_PER_CHUNK - 1) // _BATCH_DELTA_HV_3D_MIN_PER_CHUNK),
+        max_workers,
+        max(1, (B + min_per_chunk - 1) // min_per_chunk),
     )
 
     if not use_parallel or n_chunks <= 1:
@@ -697,40 +791,127 @@ def batch_delta_hv_3d(
             B,
             len(F_nd),
         )
-        return out
+        return out.astype(float, copy=False)
+
+    ex = _get_batch_delta_hv_executor(max_workers)
+
+    index_chunks = np.array_split(np.arange(B, dtype=np.intp), n_chunks)
+    nonempty = [sl for sl in index_chunks if sl.size > 0]
+    n_tasks = len(nonempty)
 
     t_dispatch0 = time.perf_counter()
+
+    if use_shm:
+        t_shm0 = time.perf_counter()
+        shm_f: SharedMemory | None = None
+        shm_c: SharedMemory | None = None
+        try:
+            if len(F_nd) == 0:
+                shm_f = SharedMemory(create=True, size=8)
+                f_shm_shape = (0, 3)
+            else:
+                shm_f = SharedMemory(create=True, size=int(F_nd.nbytes))
+                arr_f = np.ndarray(F_nd.shape, dtype=np.float64, buffer=shm_f.buf)
+                arr_f[:] = F_nd
+                f_shm_shape = (int(F_nd.shape[0]), int(F_nd.shape[1]))
+
+            nbytes_c = int(cands.nbytes)
+            shm_c = SharedMemory(create=True, size=nbytes_c)
+            arr_c = np.ndarray(cands.shape, dtype=np.float64, buffer=shm_c.buf)
+            arr_c[:] = cands
+
+            shm_setup_s = time.perf_counter() - t_shm0
+
+            specs: list[
+                tuple[str, tuple[int, int], str, tuple[int, int], int, int, float, float, float, float, bool]
+            ] = []
+            for sl in nonempty:
+                i0 = int(sl[0])
+                i1 = int(sl[-1]) + 1
+                specs.append(
+                    (
+                        shm_f.name,
+                        f_shm_shape,
+                        shm_c.name,
+                        (int(cands.shape[0]), int(cands.shape[1])),
+                        i0,
+                        i1,
+                        float(hv_old),
+                        rx,
+                        ry,
+                        rz,
+                        bool(compute_negative),
+                    )
+                )
+
+            t_after_specs = time.perf_counter()
+            dispatch_build_s = t_after_specs - t_dispatch0
+
+            t_pool0 = time.perf_counter()
+            results = list(ex.map(_batch_delta_hv_3d_shm_worker, specs))
+            pool_wall_s = time.perf_counter() - t_pool0
+
+            t_merge0 = time.perf_counter()
+            out = np.concatenate(results, axis=0)
+            merge_s = time.perf_counter() - t_merge0
+
+            logger.info(
+                "[TIMER] batch_delta_hv_3d mode=parallel_shm pool_wall_s=%.6f B=%d n_tasks=%d "
+                "max_workers=%d F_nd=%d shm_create_copy_s=%.6f dispatch_specs_s=%.6f merge_concat_s=%.6f",
+                pool_wall_s,
+                B,
+                n_tasks,
+                max_workers,
+                len(F_nd),
+                shm_setup_s,
+                dispatch_build_s,
+                merge_s,
+            )
+            return out.astype(float, copy=False)
+        finally:
+            if shm_f is not None:
+                shm_f.close()
+                try:
+                    shm_f.unlink()
+                except FileNotFoundError:
+                    pass
+            if shm_c is not None:
+                shm_c.close()
+                try:
+                    shm_c.unlink()
+                except FileNotFoundError:
+                    pass
+
+    # Fallback: persistent pool + pickled numpy chunks (for debugging / no SHM).
     chunks = np.array_split(cands, n_chunks)
     packs = [
-        (F_nd, hv_old, np.ascontiguousarray(ch, dtype=float), (rx, ry, rz), compute_negative)
+        (F_nd, hv_old, np.ascontiguousarray(ch, dtype=np.float64), (rx, ry, rz), compute_negative)
         for ch in chunks
+        if len(ch) > 0
     ]
     t_after_build = time.perf_counter()
     dispatch_build_s = t_after_build - t_dispatch0
 
-    pool_workers = min(_BATCH_DELTA_HV_3D_MAX_WORKERS, n_chunks)
     t_pool0 = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=pool_workers) as ex:
-        results = list(ex.map(_batch_delta_hv_3d_process_chunk, packs))
-    t_pool1 = time.perf_counter()
-    pool_wall_s = t_pool1 - t_pool0
+    results = list(ex.map(_batch_delta_hv_3d_process_chunk, packs))
+    pool_wall_s = time.perf_counter() - t_pool0
 
     t_merge0 = time.perf_counter()
     out = np.concatenate(results, axis=0)
     merge_s = time.perf_counter() - t_merge0
 
     logger.info(
-        "[TIMER] batch_delta_hv_3d mode=parallel pool_wall_s=%.6f B=%d n_chunks=%d pool_workers=%d "
-        "F_nd=%d dispatch_build_packs_s=%.6f merge_concat_s=%.6f",
+        "[TIMER] batch_delta_hv_3d mode=parallel_pickled pool_wall_s=%.6f B=%d n_tasks=%d "
+        "max_workers=%d F_nd=%d dispatch_build_packs_s=%.6f merge_concat_s=%.6f",
         pool_wall_s,
         B,
-        n_chunks,
-        pool_workers,
+        len(packs),
+        max_workers,
         len(F_nd),
         dispatch_build_s,
         merge_s,
     )
-    return out
+    return out.astype(float, copy=False)
 
 
 def pareto_front_max_3d_fast(Y: np.ndarray) -> np.ndarray:
