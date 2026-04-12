@@ -15,6 +15,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 
 from .config import ModelConfig
+from .log_prefs import pal_log_diag, pal_log_timer
+from .wandb_util import wandb_log as _wandb_log_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,34 @@ logger = logging.getLogger(__name__)
 def _cuda_sync_diag_enabled() -> bool:
     """When True, call torch.cuda.synchronize() at batch boundaries for clearer GPU timings."""
     return os.environ.get("PAL_CUDA_SYNC_DIAG", "").strip() in ("1", "true", "yes")
+
+
+def _dataloader_prefetch_kwargs(num_workers: int) -> dict:
+    """Optional DataLoader prefetch (only when num_workers > 0). Env: PAL_DATALOADER_PREFETCH_FACTOR (default 2)."""
+    if num_workers <= 0:
+        return {}
+    raw = os.environ.get("PAL_DATALOADER_PREFETCH_FACTOR", "2").strip()
+    try:
+        pf = int(raw)
+    except ValueError:
+        pf = 2
+    if pf < 1:
+        return {}
+    return {"prefetch_factor": pf}
+
+
+def _maybe_enable_tf32(device: str) -> None:
+    """Optional TF32 matmul on Ampere+ for throughput. Env: PAL_CUDA_MATMUL_TF32=1."""
+    if not str(device).startswith("cuda"):
+        return
+    if os.environ.get("PAL_CUDA_MATMUL_TF32", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("[TRAIN] PAL_CUDA_MATMUL_TF32 enabled (matmul/cudnn TF32)")
+    except Exception:
+        pass
 
 
 def _predict_eval_cat_max_elems() -> int:
@@ -134,6 +164,8 @@ def train_model(
     lr_scheduler_patience: int = 10,
     lr_scheduler_factor: float = 0.5,
     num_workers: Optional[int] = None,
+    wandb_log: bool = False,
+    wandb_epoch_counter: Optional[list[int]] = None,
 ) -> float:
     """Train *model* from scratch on (X, Y) with early stopping.
 
@@ -159,10 +191,12 @@ def train_model(
     else:
         nw = max(0, int(num_workers))
     pin_mem = str(device).startswith("cuda")
+    _maybe_enable_tf32(device)
     dl_common = {
         "num_workers": nw,
         "pin_memory": pin_mem,
         "persistent_workers": nw > 0,
+        **_dataloader_prefetch_kwargs(nw),
     }
 
     t_dl0 = time.perf_counter()
@@ -188,14 +222,15 @@ def train_model(
     ds = MoleculeDataset(X_tr, Y_tr)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, **dl_common)
     t_dl = time.perf_counter() - t_dl0
-    logger.info(
-        "[TIMER] train_dataloader_setup: %.3fs n_train=%d n_val=%s pin_memory=%s num_workers=%d",
-        t_dl,
-        len(ds),
-        len(val_ds) if val_ds is not None else 0,
-        pin_mem,
-        nw,
-    )
+    if pal_log_timer():
+        logger.info(
+            "[TIMER] train_dataloader_setup: %.3fs n_train=%d n_val=%s pin_memory=%s num_workers=%d",
+            t_dl,
+            len(ds),
+            len(val_ds) if val_ds is not None else 0,
+            pin_mem,
+            nw,
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(
@@ -267,23 +302,24 @@ def train_model(
             f_dl = f_h2d = f_comp = 0.0
             tr_hint = "n/a"
 
-        logger.info(
-            "[DIAG] train_epoch_timing epoch=%d train_wall_s=%.4f dataloader_next_s=%.4f host_to_device_s=%.4f "
-            "fwd_bwd_step_s=%.4f batches=%d frac_dataloader=%.2f frac_h2d=%.2f frac_fwd_bwd_step=%.2f "
-            "mean_dataloader_wait_per_batch_s=%.5f cuda_sync_diag=%s | %s",
-            epoch,
-            train_wall,
-            t_dl_wait,
-            t_h2d,
-            t_compute,
-            n_tr_batches,
-            f_dl,
-            f_h2d,
-            f_comp,
-            t_dl_wait / max(n_tr_batches, 1),
-            sync_cuda_train,
-            tr_hint,
-        )
+        if pal_log_diag():
+            logger.info(
+                "[DIAG] train_epoch_timing epoch=%d train_wall_s=%.4f dataloader_next_s=%.4f host_to_device_s=%.4f "
+                "fwd_bwd_step_s=%.4f batches=%d frac_dataloader=%.2f frac_h2d=%.2f frac_fwd_bwd_step=%.2f "
+                "mean_dataloader_wait_per_batch_s=%.5f cuda_sync_diag=%s | %s",
+                epoch,
+                train_wall,
+                t_dl_wait,
+                t_h2d,
+                t_compute,
+                n_tr_batches,
+                f_dl,
+                f_h2d,
+                f_comp,
+                t_dl_wait / max(n_tr_batches, 1),
+                sync_cuda_train,
+                tr_hint,
+            )
 
         if use_val and val_loader is not None and val_ds is not None:
             model.eval()
@@ -321,7 +357,7 @@ def train_model(
 
             val_loss = float((val_loss_sum / len(val_ds)).item())
             val_wall = sum((t_v_dl, t_v_h2d, t_v_comp))
-            if val_wall > 1e-9:
+            if val_wall > 1e-9 and pal_log_diag():
                 logger.info(
                     "[DIAG] val_epoch_timing epoch=%d val_wall_s=%.4f dataloader_next_s=%.4f host_to_device_s=%.4f "
                     "forward_s=%.4f batches=%d frac_dataloader=%.2f frac_h2d=%.2f frac_forward=%.2f",
@@ -357,20 +393,34 @@ def train_model(
 
         epochs_ran = epoch + 1
         dt_ep = time.perf_counter() - t_ep0
-        if use_val and val_loader is not None and val_ds is not None:
-            logger.info(
-                "[TIMER] train_epoch: epoch=%d dt=%.3fs train_loss=%.6g val_loss=%.6g",
-                epoch,
-                dt_ep,
-                train_loss,
-                monitored,
-            )
-        else:
-            logger.info(
-                "[TIMER] train_epoch: epoch=%d dt=%.3fs train_loss=%.6g",
-                epoch,
-                dt_ep,
-                train_loss,
+        if pal_log_timer():
+            if use_val and val_loader is not None and val_ds is not None:
+                logger.info(
+                    "[TIMER] train_epoch: epoch=%d dt=%.3fs train_loss=%.6g val_loss=%.6g",
+                    epoch,
+                    dt_ep,
+                    train_loss,
+                    monitored,
+                )
+            else:
+                logger.info(
+                    "[TIMER] train_epoch: epoch=%d dt=%.3fs train_loss=%.6g",
+                    epoch,
+                    dt_ep,
+                    train_loss,
+                )
+
+        if wandb_log and wandb_epoch_counter is not None:
+            ep_step = int(wandb_epoch_counter[0])
+            wandb_epoch_counter[0] = ep_step + 1
+            val_for_wandb = float(monitored) if use_val else float(train_loss)
+            _wandb_log_metrics(
+                {
+                    "train/epoch": ep_step,
+                    "train/train_loss": float(train_loss),
+                    "train/val_loss": val_for_wandb,
+                    "timing/train_epoch_s": float(dt_ep),
+                }
             )
 
         if epoch >= min_epochs and patience > 0 and wait >= patience:
@@ -490,17 +540,18 @@ def mc_predict(
     std_out = torch.sqrt(torch.clamp(var, min=1e-9))
     t_mc = time.perf_counter() - t_mc0
     n_batch = (N + batch_size - 1) // batch_size
-    logger.info(
-        "[TIMER] mc_predict: %.3fs N=%d batch_size=%d n_passes=%d device=%s batches=%d forwards≈%d",
-        t_mc,
-        N,
-        batch_size,
-        n_passes,
-        device,
-        n_batch,
-        n_batch * n_passes,
-    )
-    if prep_ts:
+    if pal_log_timer():
+        logger.info(
+            "[TIMER] mc_predict: %.3fs N=%d batch_size=%d n_passes=%d device=%s batches=%d forwards≈%d",
+            t_mc,
+            N,
+            batch_size,
+            n_passes,
+            device,
+            n_batch,
+            n_batch * n_passes,
+        )
+    if prep_ts and pal_log_diag():
         mp = sum(prep_ts) / len(prep_ts)
         mf = sum(fwd_ts) / len(fwd_ts)
         md = sum(d2h_ts) / len(d2h_ts)
@@ -603,26 +654,28 @@ def predict_eval(
         if sync_b:
             torch.cuda.synchronize()
         total_d2h = time.perf_counter() - t_cat0
-        logger.info(
-            "[DIAG] predict_eval: gpu_cat_single_d2h N*d=%d max_elems=%d cat_plus_d2h_s=%.6f batches=%d",
-            N * d_out,
-            max_cat_elems,
-            total_d2h,
-            len(prep_ts),
-        )
+        if pal_log_diag():
+            logger.info(
+                "[DIAG] predict_eval: gpu_cat_single_d2h N*d=%d max_elems=%d cat_plus_d2h_s=%.6f batches=%d",
+                N * d_out,
+                max_cat_elems,
+                total_d2h,
+                len(prep_ts),
+            )
 
     model.train()
     dt = time.perf_counter() - t0
     n_b = len(prep_ts)
-    logger.info(
-        "[TIMER] predict_eval: %.3fs N=%d batch_size=%d device=%s gpu_cat=%s",
-        dt,
-        N,
-        batch_size,
-        device,
-        use_gpu_cat,
-    )
-    if prep_ts and not use_gpu_cat:
+    if pal_log_timer():
+        logger.info(
+            "[TIMER] predict_eval: %.3fs N=%d batch_size=%d device=%s gpu_cat=%s",
+            dt,
+            N,
+            batch_size,
+            device,
+            use_gpu_cat,
+        )
+    if prep_ts and not use_gpu_cat and pal_log_diag():
         mp = sum(prep_ts) / n_b
         mf = sum(fwd_ts) / n_b
         md = sum(d2h_ts) / n_b
@@ -652,7 +705,7 @@ def predict_eval(
             md + mp,
             pe_hint,
         )
-    elif prep_ts and use_gpu_cat:
+    elif prep_ts and use_gpu_cat and pal_log_diag():
         mp = sum(prep_ts) / n_b
         mf = sum(fwd_ts) / n_b
         logger.info(

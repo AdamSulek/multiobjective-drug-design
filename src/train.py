@@ -24,6 +24,7 @@ from pal.plots import (
     plot_pareto_snapshots,
     plot_validation_metrics,
 )
+from pal.log_prefs import pal_log_timer, reset_pal_log_prefs, set_pal_log_prefs
 from pal.utils import load_seed_indices, seed_everything, setup_logging
 
 from .loop import build_strategies, run_loop_matrix
@@ -264,6 +265,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--wandb_project", type=str, default="multiobjective-drug-design")
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument(
+        "--diag-logging",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit [DIAG] lines (GPU / dataloader detail). Use --no-diag-logging to disable.",
+    )
+    p.add_argument(
+        "--timer-logging",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit [TIMER] lines. Use --no-timer-logging to disable.",
+    )
     return p.parse_args()
 
 
@@ -287,6 +300,31 @@ def _init_wandb(args: argparse.Namespace, config: ExperimentConfig, n_obj: int):
             "ref_point": list(config.al.ref_point),
         },
     )
+    # Chart axes: AL iteration vs training epoch (global across AL iters).
+    wandb.define_metric("al/iteration")
+    wandb.define_metric("train/epoch")
+    _al_metrics = (
+        "loop/hv",
+        "loop/delta_hv",
+        "timing/iteration_s",
+        "timing/fit_s",
+        "timing/acquisition_s",
+        "data/n_labeled",
+        "strategy/k_ucb",
+        "strategy/key",
+        "strategy/name",
+        "al/replicate",
+    )
+    for name in _al_metrics:
+        try:
+            wandb.define_metric(name, step_metric="al/iteration")
+        except Exception:
+            pass
+    for name in ("train/train_loss", "train/val_loss", "timing/train_epoch_s"):
+        try:
+            wandb.define_metric(name, step_metric="train/epoch")
+        except Exception:
+            pass
     return run
 
 
@@ -295,22 +333,6 @@ def _log_wandb_summary(wandb_run, results: dict[str, Any], t_total_s: float) -> 
         return
 
     wandb_run.summary["runtime_total_s"] = float(t_total_s)
-
-    for key, result in results.items():
-        for rep_idx, state in enumerate(result.states):
-            for it, hv in enumerate(state.hv_history):
-                row = {
-                    "strategy_key": key,
-                    "strategy_name": result.name,
-                    "replicate": int(rep_idx),
-                    "iteration": int(it),
-                    "hypervolume": float(hv),
-                }
-                if it < len(state.acq_time_per_iter):
-                    row["acq_time_s"] = float(state.acq_time_per_iter[it])
-                if it > 0 and (it - 1) < len(state.iter_stage_times):
-                    row["iter_total_s"] = float(state.iter_stage_times[it - 1].get("total", 0.0))
-                wandb_run.log(row)
 
     for key, result in results.items():
         finals = [float(s.hv_history[-1]) for s in result.states if len(s.hv_history) > 0]
@@ -357,92 +379,100 @@ def main() -> None:
     config.model.num_workers = nw
     os.makedirs(args.output_dir, exist_ok=True)
 
-    t_pool = time.perf_counter()
-    df, X_pool, Y_pool = _load_pool_data(args, config)
-    logger.info(
-        "[TIMER] pool_load: %.3fs N=%d n_obj=%d x_mmap=%s",
-        time.perf_counter() - t_pool,
-        len(Y_pool),
-        int(Y_pool.shape[1]),
-        isinstance(X_pool, np.memmap),
-    )
-    n_obj = int(Y_pool.shape[1])
-    if n_obj not in (2, 3):
-        raise ValueError(f"Only 2D/3D objectives are supported, got {n_obj}")
-    logger.info(f"Objective dimension detected: {n_obj}D")
+    config.log_diag = bool(args.diag_logging)
+    config.log_timer = bool(args.timer_logging)
+    _lp_tok = set_pal_log_prefs(log_diag=config.log_diag, log_timer=config.log_timer)
+    try:
+        t_pool = time.perf_counter()
+        df, X_pool, Y_pool = _load_pool_data(args, config)
+        if pal_log_timer():
+            logger.info(
+                "[TIMER] pool_load: %.3fs N=%d n_obj=%d x_mmap=%s",
+                time.perf_counter() - t_pool,
+                len(Y_pool),
+                int(Y_pool.shape[1]),
+                isinstance(X_pool, np.memmap),
+            )
+        n_obj = int(Y_pool.shape[1])
+        if n_obj not in (2, 3):
+            raise ValueError(f"Only 2D/3D objectives are supported, got {n_obj}")
+        logger.info(f"Objective dimension detected: {n_obj}D")
 
-    if args.ref_point is None:
-        args.ref_point = list(auto_ref_point(Y_pool, margin_frac=0.01))
-        logger.info(f"Auto ref_point = {args.ref_point}")
-    if len(args.ref_point) != n_obj:
-        raise ValueError(f"--ref_point must have dimension {n_obj}, got {len(args.ref_point)}")
-    config.al.ref_point = tuple(args.ref_point)
+        if args.ref_point is None:
+            args.ref_point = list(auto_ref_point(Y_pool, margin_frac=0.01))
+            logger.info(f"Auto ref_point = {args.ref_point}")
+        if len(args.ref_point) != n_obj:
+            raise ValueError(f"--ref_point must have dimension {n_obj}, got {len(args.ref_point)}")
+        config.al.ref_point = tuple(args.ref_point)
 
-    oracle_hv = None
-    if args.global_pareto_file is not None:
-        df_gp = _read_tabular(args.global_pareto_file)
-        missing = [c for c in args.property_cols if c not in df_gp.columns]
-        if missing:
-            raise ValueError(f"Columns not found in global_pareto_file: {missing}")
-        Y_gp = df_gp[args.property_cols].to_numpy(dtype=np.float32)
-        if args.negate_cols:
-            for col in args.negate_cols:
-                Y_gp[:, args.property_cols.index(col)] *= -1.0
-        oracle_hv = hypervolume_2d(Y_gp, config.al.ref_point) if n_obj == 2 else hypervolume_3d_max_fast(Y_gp, config.al.ref_point)
-        logger.info(f"Global Pareto HV = {oracle_hv:.6f} (|GP|={len(Y_gp)})")
+        oracle_hv = None
+        if args.global_pareto_file is not None:
+            df_gp = _read_tabular(args.global_pareto_file)
+            missing = [c for c in args.property_cols if c not in df_gp.columns]
+            if missing:
+                raise ValueError(f"Columns not found in global_pareto_file: {missing}")
+            Y_gp = df_gp[args.property_cols].to_numpy(dtype=np.float32)
+            if args.negate_cols:
+                for col in args.negate_cols:
+                    Y_gp[:, args.property_cols.index(col)] *= -1.0
+            oracle_hv = hypervolume_2d(Y_gp, config.al.ref_point) if n_obj == 2 else hypervolume_3d_max_fast(Y_gp, config.al.ref_point)
+            logger.info(f"Global Pareto HV = {oracle_hv:.6f} (|GP|={len(Y_gp)})")
 
-    strategies = build_strategies(
-        n_obj=n_obj,
-        strategy_names=list(args.strategies),
-        k_list=list(args.k_list),
-        ucb_include_k0=bool(args.ucb_include_k0),
-        zero_negative_hv=bool(args.zero_negative_hv),
-        direction_use_front_penalty=bool(args.direction_use_front_penalty),
-        ucb_max_exact_candidates=args.ucb_max_exact_candidates,
-    )
+        strategies = build_strategies(
+            n_obj=n_obj,
+            strategy_names=list(args.strategies),
+            k_list=list(args.k_list),
+            ucb_include_k0=bool(args.ucb_include_k0),
+            zero_negative_hv=bool(args.zero_negative_hv),
+            direction_use_front_penalty=bool(args.direction_use_front_penalty),
+            ucb_max_exact_candidates=args.ucb_max_exact_candidates,
+        )
 
-    seed_indices_files = [args.seed_indices_file] if args.seed_indices_file is not None else None
-    run = _init_wandb(args, config, n_obj)
+        seed_indices_files = [args.seed_indices_file] if args.seed_indices_file is not None else None
+        run = _init_wandb(args, config, n_obj)
+        config.wandb_log = run is not None
 
-    t_run = time.perf_counter()
-    loop_out = run_loop_matrix(
-        config=config,
-        X_pool=X_pool,
-        Y_pool=Y_pool,
-        strategies=strategies,
-        seed_indices_files=seed_indices_files,
-        load_seed_indices_fn=load_seed_indices,
-    )
-    logger.info(f"[TIME] run_loop_matrix total={time.perf_counter() - t_run:.3f}s")
-    _log_train_infer_stage_totals(loop_out.results, logger)
+        t_run = time.perf_counter()
+        loop_out = run_loop_matrix(
+            config=config,
+            X_pool=X_pool,
+            Y_pool=Y_pool,
+            strategies=strategies,
+            seed_indices_files=seed_indices_files,
+            load_seed_indices_fn=load_seed_indices,
+        )
+        logger.info(f"[TIME] run_loop_matrix total={time.perf_counter() - t_run:.3f}s")
+        _log_train_infer_stage_totals(loop_out.results, logger)
 
-    save_iteration_selections(
-        results=loop_out.results,
-        df=df,
-        output_dir=args.output_dir,
-        id_col="ID",
-        smiles_col=args.smiles_col,
-    )
+        save_iteration_selections(
+            results=loop_out.results,
+            df=df,
+            output_dir=args.output_dir,
+            id_col="ID",
+            smiles_col=args.smiles_col,
+        )
 
-    plot_jobs = [
-        (plot_hv_convergence, {"oracle_hv": oracle_hv, "config": config, "save_path": os.path.join(args.output_dir, "hv_convergence.png")}),
-        (plot_pareto_snapshots, {"Y_pool": Y_pool, "config": config, "save_path": os.path.join(args.output_dir, "pareto_fronts.png")}),
-        (plot_iteration_selections, {"Y_pool": Y_pool, "config": config, "save_path": os.path.join(args.output_dir, "iteration_selections.png")}),
-        (plot_iteration_selections_3d, {"Y_pool": Y_pool, "config": config, "save_path": os.path.join(args.output_dir, "iteration_selections_3d.png")}),
-        (plot_acq_timing, {"config": config, "save_path": os.path.join(args.output_dir, "acq_timing.png")}),
-        (plot_validation_metrics, {"config": config, "save_path": os.path.join(args.output_dir, "validation_metrics.png")}),
-    ]
-    for fn, kwargs in plot_jobs:
-        fn(loop_out.results, **kwargs)
+        plot_jobs = [
+            (plot_hv_convergence, {"oracle_hv": oracle_hv, "config": config, "save_path": os.path.join(args.output_dir, "hv_convergence.png")}),
+            (plot_pareto_snapshots, {"Y_pool": Y_pool, "config": config, "save_path": os.path.join(args.output_dir, "pareto_fronts.png")}),
+            (plot_iteration_selections, {"Y_pool": Y_pool, "config": config, "save_path": os.path.join(args.output_dir, "iteration_selections.png")}),
+            (plot_iteration_selections_3d, {"Y_pool": Y_pool, "config": config, "save_path": os.path.join(args.output_dir, "iteration_selections_3d.png")}),
+            (plot_acq_timing, {"config": config, "save_path": os.path.join(args.output_dir, "acq_timing.png")}),
+            (plot_validation_metrics, {"config": config, "save_path": os.path.join(args.output_dir, "validation_metrics.png")}),
+        ]
+        for fn, kwargs in plot_jobs:
+            fn(loop_out.results, **kwargs)
 
-    save_hv_csv(results=loop_out.results, config=config, save_path=os.path.join(args.output_dir, "hv_convergence.csv"))
-    _log_global_timing_summary(loop_out.results, logger)
-    _log_and_save_final_results(loop_out.results, args.output_dir, logger)
+        save_hv_csv(results=loop_out.results, config=config, save_path=os.path.join(args.output_dir, "hv_convergence.csv"))
+        _log_global_timing_summary(loop_out.results, logger)
+        _log_and_save_final_results(loop_out.results, args.output_dir, logger)
 
-    t_total = time.perf_counter() - t_all
-    _log_wandb_summary(run, loop_out.results, t_total)
-    logger.info(f"[TIME] full_pipeline total={t_total:.3f}s")
-    logger.info("Done!")
+        t_total = time.perf_counter() - t_all
+        _log_wandb_summary(run, loop_out.results, t_total)
+        logger.info(f"[TIME] full_pipeline total={t_total:.3f}s")
+        logger.info("Done!")
+    finally:
+        reset_pal_log_prefs(_lp_tok)
 
 
 if __name__ == "__main__":

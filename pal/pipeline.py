@@ -126,6 +126,8 @@ def run_comparison(
                 config,
                 seed=rep_seed,
                 seed_indices=seed_indices,
+                strategy_key=strategy_key,
+                replicate_idx=int(r),
             )
 
             results[strategy_key].hv_histories.append(state.hv_history)

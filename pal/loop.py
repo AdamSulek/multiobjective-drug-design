@@ -10,8 +10,10 @@ import numpy as np
 
 from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
+from .log_prefs import pal_log_diag, pal_log_timer
 from .model import build_model, mc_predict, predict_eval, train_model
 from .pareto import hypervolume_2d, hypervolume_3d_max_fast, pareto_front_max_3d_fast
+from .wandb_util import strategy_k_param, wandb_log as _wandb_log_metrics
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -32,7 +34,8 @@ def timed(stage: str):
     t0 = time.perf_counter()
     yield
     dt = time.perf_counter() - t0
-    LOGGER.info(f"[TIMER] {stage}: {dt:.3f}s")
+    if pal_log_timer():
+        LOGGER.info(f"[TIMER] {stage}: {dt:.3f}s")
 
 
 def _hv(Y: np.ndarray, ref_point: tuple[float, ...]) -> float:
@@ -161,6 +164,9 @@ def run_al_loop(
     config: ExperimentConfig,
     seed: int,
     seed_indices: np.ndarray | None = None,
+    *,
+    strategy_key: str | None = None,
+    replicate_idx: int = 0,
 ):
     N = len(Y_pool)
     n_obj = int(Y_pool.shape[1])
@@ -207,6 +213,27 @@ def run_al_loop(
         f"labeled={len(state.labeled_indices):4d}  HV={hv0:.4f}  acq_time=0.000s"
     )
 
+    wandb_epoch_counter: list[int] | None = [0] if config.wandb_log else None
+
+    if config.wandb_log:
+        wb0: dict = {
+            "al/iteration": 0,
+            "al/replicate": int(replicate_idx),
+            "loop/hv": float(hv0),
+            "loop/delta_hv": 0.0,
+            "timing/iteration_s": 0.0,
+            "timing/fit_s": 0.0,
+            "timing/acquisition_s": 0.0,
+            "data/n_labeled": int(len(state.labeled_indices)),
+            "strategy/name": acq_fn.name,
+        }
+        if strategy_key is not None:
+            wb0["strategy/key"] = strategy_key
+        k0 = strategy_k_param(acq_fn)
+        if k0 is not None:
+            wb0["strategy/k_ucb"] = k0
+        _wandb_log_metrics(wb0)
+
     for it in range(1, al.n_iterations + 1):
         state.iteration = it
         iter_t0 = time.perf_counter()
@@ -240,6 +267,8 @@ def run_al_loop(
                 lr_scheduler_patience=mcfg.lr_scheduler_patience,
                 lr_scheduler_factor=mcfg.lr_scheduler_factor,
                 num_workers=mcfg.num_workers,
+                wandb_log=config.wandb_log,
+                wandb_epoch_counter=wandb_epoch_counter,
             )
         t_train = time.perf_counter() - t0
 
@@ -260,12 +289,13 @@ def run_al_loop(
         X_unlabeled = X_pool[state.unlabeled_indices]
         t_xu = time.perf_counter() - t_xu0
         _d_feat = int(X_unlabeled.shape[1]) if getattr(X_unlabeled, "ndim", 0) >= 2 else -1
-        LOGGER.info(
-            "[TIMER] X_pool[unlabeled_indices] materialize: %.3fs U=%d D=%d",
-            t_xu,
-            len(state.unlabeled_indices),
-            _d_feat,
-        )
+        if pal_log_timer():
+            LOGGER.info(
+                "[TIMER] X_pool[unlabeled_indices] materialize: %.3fs U=%d D=%d",
+                t_xu,
+                len(state.unlabeled_indices),
+                _d_feat,
+            )
 
         needs_cov = getattr(acq_fn, "needs_full_cov", False)
         needs_uncertainty = getattr(acq_fn, "needs_uncertainty", True)
@@ -286,12 +316,13 @@ def run_al_loop(
             y_mean=Y_mean,
             y_std=Y_std,
         )
-        LOGGER.info(
-            "[GPU_INFER] unlabeled U=%d device=%s pred_unlab_s=%.3f",
-            len(state.unlabeled_indices),
-            config.device,
-            t_pred_unlabeled,
-        )
+        if pal_log_diag():
+            LOGGER.info(
+                "[GPU_INFER] unlabeled U=%d device=%s pred_unlab_s=%.3f",
+                len(state.unlabeled_indices),
+                config.device,
+                t_pred_unlabeled,
+            )
 
         pareto_front = None
         hv_front = None
@@ -303,19 +334,21 @@ def run_al_loop(
             with timed("hypervolume_3d_max_fast(front)"):
                 hv_front = hypervolume_3d_max_fast(pareto_front, al.ref_point)
 
-            LOGGER.info(
-                f"[PARETO] it={it} labeled={state.Y_labeled.shape[0]} "
-                f"front={pareto_front.shape[0]} hv_front={hv_front:.6f}"
-            )
+            if pal_log_diag():
+                LOGGER.info(
+                    f"[PARETO] it={it} labeled={state.Y_labeled.shape[0]} "
+                    f"front={pareto_front.shape[0]} hv_front={hv_front:.6f}"
+                )
 
         t0 = time.perf_counter()
         with timed("acquisition.select()"):
             cov_shape = None if covs is None else covs.shape
             std_shape = None if stds is None else stds.shape
-            LOGGER.info(
-                f"[ACQ] calling select "
-                f"means={means.shape} stds={std_shape} covs={cov_shape}"
-            )
+            if pal_log_diag():
+                LOGGER.info(
+                    f"[ACQ] calling select "
+                    f"means={means.shape} stds={std_shape} covs={cov_shape}"
+                )
 
             select_kwargs = {
                 "k": al.batch_size,
@@ -431,6 +464,25 @@ def run_al_loop(
             f"pred_unlab={t_pred_unlabeled:.3f}s "
             f"cov_reconstruct={t_cov_reconstruct:.3f}s acq={state.acq_time_per_iter[-1]:.3f}s hv={t_hv:.3f}s"
         )
+
+        if config.wandb_log:
+            wb: dict = {
+                "al/iteration": int(it),
+                "al/replicate": int(replicate_idx),
+                "loop/hv": float(hv),
+                "loop/delta_hv": float(hv_gain),
+                "timing/iteration_s": float(t_iter),
+                "timing/fit_s": float(t_train),
+                "timing/acquisition_s": float(state.acq_time_per_iter[-1]),
+                "data/n_labeled": int(len(state.labeled_indices)),
+                "strategy/name": acq_fn.name,
+            }
+            if strategy_key is not None:
+                wb["strategy/key"] = strategy_key
+            k_it = strategy_k_param(acq_fn)
+            if k_it is not None:
+                wb["strategy/k_ucb"] = k_it
+            _wandb_log_metrics(wb)
 
     _log_timing_summary(acq_fn.name, state)
     return state

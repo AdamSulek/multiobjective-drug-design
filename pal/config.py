@@ -63,3 +63,8 @@ class ExperimentConfig:
     output_dir: str = "pal_results"
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     obj_names: Tuple[str, str] = ("Objective 0", "Objective 1")
+    # Verbose logging (see pal.log_prefs; train.py sets prefs from CLI --diag-logging / --timer-logging).
+    log_diag: bool = False
+    log_timer: bool = False
+    # When True, call wandb.log from train_model / run_al_loop (requires active wandb.run).
+    wandb_log: bool = True

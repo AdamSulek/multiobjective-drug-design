@@ -25,6 +25,8 @@ from typing import Tuple
 
 import numpy as np
 
+from .log_prefs import pal_log_timer
+
 logger = logging.getLogger(__name__)
 
 # Parallel batch_delta_hv_3d: defaults (overridden per-call from os.environ).
@@ -785,12 +787,13 @@ def batch_delta_hv_3d(
         t0 = time.perf_counter()
         out = _delta_hv_3d_dense_block(F_nd, hv_old, cands, (rx, ry, rz), compute_negative)
         t_serial = time.perf_counter() - t0
-        logger.info(
-            "[TIMER] batch_delta_hv_3d mode=serial total_s=%.6f B=%d F_nd=%d",
-            t_serial,
-            B,
-            len(F_nd),
-        )
+        if pal_log_timer():
+            logger.info(
+                "[TIMER] batch_delta_hv_3d mode=serial total_s=%.6f B=%d F_nd=%d",
+                t_serial,
+                B,
+                len(F_nd),
+            )
         return out.astype(float, copy=False)
 
     ex = _get_batch_delta_hv_executor(max_workers)
@@ -855,18 +858,19 @@ def batch_delta_hv_3d(
             out = np.concatenate(results, axis=0)
             merge_s = time.perf_counter() - t_merge0
 
-            logger.info(
-                "[TIMER] batch_delta_hv_3d mode=parallel_shm pool_wall_s=%.6f B=%d n_tasks=%d "
-                "max_workers=%d F_nd=%d shm_create_copy_s=%.6f dispatch_specs_s=%.6f merge_concat_s=%.6f",
-                pool_wall_s,
-                B,
-                n_tasks,
-                max_workers,
-                len(F_nd),
-                shm_setup_s,
-                dispatch_build_s,
-                merge_s,
-            )
+            if pal_log_timer():
+                logger.info(
+                    "[TIMER] batch_delta_hv_3d mode=parallel_shm pool_wall_s=%.6f B=%d n_tasks=%d "
+                    "max_workers=%d F_nd=%d shm_create_copy_s=%.6f dispatch_specs_s=%.6f merge_concat_s=%.6f",
+                    pool_wall_s,
+                    B,
+                    n_tasks,
+                    max_workers,
+                    len(F_nd),
+                    shm_setup_s,
+                    dispatch_build_s,
+                    merge_s,
+                )
             return out.astype(float, copy=False)
         finally:
             if shm_f is not None:
@@ -900,17 +904,18 @@ def batch_delta_hv_3d(
     out = np.concatenate(results, axis=0)
     merge_s = time.perf_counter() - t_merge0
 
-    logger.info(
-        "[TIMER] batch_delta_hv_3d mode=parallel_pickled pool_wall_s=%.6f B=%d n_tasks=%d "
-        "max_workers=%d F_nd=%d dispatch_build_packs_s=%.6f merge_concat_s=%.6f",
-        pool_wall_s,
-        B,
-        len(packs),
-        max_workers,
-        len(F_nd),
-        dispatch_build_s,
-        merge_s,
-    )
+    if pal_log_timer():
+        logger.info(
+            "[TIMER] batch_delta_hv_3d mode=parallel_pickled pool_wall_s=%.6f B=%d n_tasks=%d "
+            "max_workers=%d F_nd=%d dispatch_build_packs_s=%.6f merge_concat_s=%.6f",
+            pool_wall_s,
+            B,
+            len(packs),
+            max_workers,
+            len(F_nd),
+            dispatch_build_s,
+            merge_s,
+        )
     return out.astype(float, copy=False)
 
 

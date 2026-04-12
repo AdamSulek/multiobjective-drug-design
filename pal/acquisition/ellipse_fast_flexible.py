@@ -1,10 +1,16 @@
 """Fast vectorized ND ellipse acquisition — no Python loops over directions."""
 
 from __future__ import annotations
+
+import logging
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
 from typing import Tuple
 
 import numpy as np
 
+from ..log_prefs import pal_log_diag, pal_log_timer
 from ..pareto import (
     pareto_front_2D,
     pareto_front_max_3d_fast,
@@ -15,6 +21,121 @@ from ..pareto import (
 )
 
 from .base import AcquisitionFunction
+
+logger = logging.getLogger(__name__)
+
+# --- ND (>3) multiprocessing: module-level for spawn/fork pickling ---
+_ELL_ND_F: np.ndarray | None = None
+_ELL_ND_REF: tuple | None = None
+_ELL_ND_BH: float | None = None
+
+
+def _ellipse_nd_mp_init(front: np.ndarray, ref_point: tuple, base_hv: float) -> None:
+    global _ELL_ND_F, _ELL_ND_REF, _ELL_ND_BH
+    _ELL_ND_F = np.asarray(front, dtype=np.float32)
+    _ELL_ND_REF = ref_point
+    _ELL_ND_BH = float(base_hv)
+
+
+def _ellipse_nd_mp_scores_chunk(chunk: np.ndarray) -> np.ndarray:
+    """Child process: score one chunk of candidate rows (must stay picklable)."""
+    from ..pareto import hypervolume_nd, pareto_skyline
+
+    f = _ELL_ND_F
+    ref = _ELL_ND_REF
+    bh = _ELL_ND_BH
+    if f is None or ref is None or bh is None:
+        raise RuntimeError("FastEllipse ND worker not initialized")
+    chunk = np.asarray(chunk, dtype=np.float32)
+    m = int(chunk.shape[0])
+    out = np.zeros(m, dtype=np.float32)
+    for i in range(m):
+        union = np.vstack((f, chunk[i]))
+        new_front = union[pareto_skyline(union)]
+        out[i] = float(hypervolume_nd(new_front, ref)) - bh
+    return out
+
+
+def _ellipse_nd_scores_sequential_with_base(
+    front: np.ndarray,
+    points: np.ndarray,
+    ref_point: tuple,
+    base_hv: float,
+) -> np.ndarray:
+    m = int(points.shape[0])
+    out = np.zeros(m, dtype=np.float32)
+    f = np.asarray(front, dtype=np.float32)
+    pts = np.asarray(points, dtype=np.float32)
+    for i in range(m):
+        union = np.vstack((f, pts[i]))
+        new_front = union[pareto_skyline(union)]
+        out[i] = float(hypervolume_nd(new_front, ref_point)) - float(base_hv)
+    return out
+
+
+def _ellipse_nd_scores_parallel_or_seq(
+    front: np.ndarray,
+    points: np.ndarray,
+    ref_point: tuple,
+    *,
+    context: str,
+) -> np.ndarray:
+    """ND hypervolume scoring: optional ProcessPoolExecutor (env FAST_ELLIPSE_ND_*)."""
+    M = int(points.shape[0])
+    if M == 0:
+        return np.zeros(0, dtype=np.float32)
+    front = np.asarray(front, dtype=np.float32)
+    points = np.asarray(points, dtype=np.float32)
+    base_hv = float(hypervolume_nd(front, ref_point))
+    pe = os.environ.get("FAST_ELLIPSE_ND_PARALLEL", "0").strip().lower() in ("1", "true", "yes")
+    nw = max(1, int(os.environ.get("FAST_ELLIPSE_ND_WORKERS", str(min(32, (os.cpu_count() or 1))))))
+    min_chunk = max(1, int(os.environ.get("FAST_ELLIPSE_ND_MIN_CHUNK", "64")))
+    if not pe or nw <= 1 or M < min_chunk * 2:
+        t0 = time.perf_counter()
+        out = _ellipse_nd_scores_sequential_with_base(front, points, ref_point, base_hv)
+        if pal_log_diag():
+            logger.info(
+                "[FAST_ELLIPSE] ND %s sequential rows=%d wall_s=%.4f backend=main",
+                context,
+                M,
+                time.perf_counter() - t0,
+            )
+        return out
+    chunk_sz = max(min_chunk, (M + nw - 1) // nw)
+    chunks = [points[i : i + chunk_sz] for i in range(0, M, chunk_sz)]
+    t0 = time.perf_counter()
+    with ProcessPoolExecutor(
+        max_workers=nw,
+        initializer=_ellipse_nd_mp_init,
+        initargs=(front, ref_point, base_hv),
+    ) as ex:
+        parts = list(ex.map(_ellipse_nd_mp_scores_chunk, chunks))
+    out = np.concatenate(parts, axis=0)
+    if pal_log_diag():
+        logger.info(
+            "[FAST_ELLIPSE] ND %s multiprocessing workers=%d n_chunks=%d rows=%d wall_s=%.4f "
+            "backend=ProcessPoolExecutor",
+            context,
+            nw,
+            len(chunks),
+            M,
+            time.perf_counter() - t0,
+        )
+    return out
+
+
+def _log_fast_ellipse_3d_delta_hv_config() -> None:
+    if not pal_log_diag():
+        return
+    logger.info(
+        "[FAST_ELLIPSE] 3D scoring uses batch_delta_hv_3d | "
+        "BATCH_DELTA_HV_3D_PARALLEL=%s WORKERS=%s USE_SHM=%s MIN_PER_CHUNK=%s "
+        "(same knobs as UCB; set env before launch)",
+        os.environ.get("BATCH_DELTA_HV_3D_PARALLEL", "1"),
+        os.environ.get("BATCH_DELTA_HV_3D_WORKERS", "20"),
+        os.environ.get("BATCH_DELTA_HV_3D_USE_SHM", "1"),
+        os.environ.get("BATCH_DELTA_HV_3D_MIN_PER_CHUNK", "50"),
+    )
 
 
 # ---------------------------------------------------------
@@ -114,6 +235,8 @@ class FastEllipseAcquisitionFlexible(AcquisitionFunction):
         if n_obj < 2:
             raise ValueError("Need at least 2 objectives")
 
+        _t_score = time.perf_counter()
+
         # -------------------------------------------------
         # Pareto front
         # -------------------------------------------------
@@ -133,6 +256,9 @@ class FastEllipseAcquisitionFlexible(AcquisitionFunction):
 
         dirs = self._get_dirs(n_obj)
         D = dirs.shape[0]
+
+        if n_obj == 3:
+            _log_fast_ellipse_3d_delta_hv_config()
 
         # -------------------------------------------------
         # No covariance → just evaluate means
@@ -157,21 +283,22 @@ class FastEllipseAcquisitionFlexible(AcquisitionFunction):
                 )
 
             else:
-                base_hv = hypervolume_nd(front, ref_point)
-
-                scores = np.zeros(N, dtype=np.float32)
-
-                for i in range(N):
-                    union = np.vstack((front, means[i]))
-                    new_front = union[pareto_skyline(union)]
-                    hv = hypervolume_nd(new_front, ref_point)
-                    scores[i] = hv - base_hv
+                scores = _ellipse_nd_scores_parallel_or_seq(
+                    front, means, ref_point, context="means"
+                )
 
             scores = scores.astype(np.float32)
 
             if self.clip_negative_hv:
                 np.maximum(scores, 0.0, out=scores)
 
+            if pal_log_timer():
+                logger.info(
+                    "[TIMER] FastEllipse.score n_cand=%d n_obj=%d covs=False wall_s=%.4f",
+                    N,
+                    n_obj,
+                    time.perf_counter() - _t_score,
+                )
             return scores
 
         # -------------------------------------------------
@@ -214,6 +341,13 @@ class FastEllipseAcquisitionFlexible(AcquisitionFunction):
         flat_cand = cand_idx[keep]
 
         if flat_points.shape[0] == 0:
+            if pal_log_timer():
+                logger.info(
+                    "[TIMER] FastEllipse.score n_cand=%d n_obj=%d covs=True wall_s=%.4f (empty flat)",
+                    N,
+                    n_obj,
+                    time.perf_counter() - _t_score,
+                )
             return np.zeros(N, dtype=np.float32)
 
         # -------------------------------------------------
@@ -239,16 +373,9 @@ class FastEllipseAcquisitionFlexible(AcquisitionFunction):
             )
 
         else:
-
-            base_hv = hypervolume_nd(front, ref_point)
-
-            flat_dhv = np.zeros(flat_points.shape[0], dtype=np.float32)
-
-            for i, p in enumerate(flat_points):
-                union = np.vstack((front, p))
-                new_front = union[pareto_skyline(union)]
-                hv = hypervolume_nd(new_front, ref_point)
-                flat_dhv[i] = hv - base_hv
+            flat_dhv = _ellipse_nd_scores_parallel_or_seq(
+                front, flat_points, ref_point, context="ellipse_flat"
+            )
 
         # -------------------------------------------------
         # Max per candidate
@@ -263,4 +390,11 @@ class FastEllipseAcquisitionFlexible(AcquisitionFunction):
         if self.clip_negative_hv:
             np.maximum(scores, 0.0, out=scores)
 
+        if pal_log_timer():
+            logger.info(
+                "[TIMER] FastEllipse.score n_cand=%d n_obj=%d covs=True wall_s=%.4f",
+                N,
+                n_obj,
+                time.perf_counter() - _t_score,
+            )
         return scores

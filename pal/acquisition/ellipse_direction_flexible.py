@@ -1,7 +1,9 @@
 from __future__ import annotations
 from typing import Tuple, Optional
+import os
 import time
 import logging
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
@@ -13,6 +15,128 @@ from ..pareto import (
 from .base import AcquisitionFunction
 
 logger = logging.getLogger(__name__)
+
+# --- Optional multiprocessing for N×K directional score (env ELLIPSE_DIRECTIONS_*) ---
+_ED_W: np.ndarray | None = None
+_ED_PEN: np.ndarray | None = None
+_ED_K: float | None = None
+_ED_EPS: float | None = None
+
+
+def _ellipse_directions_score_core(
+    means: np.ndarray,
+    covs_use: np.ndarray,
+    W: np.ndarray,
+    penalties: np.ndarray,
+    k: float,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized directional ellipsoid scores for candidates (N,d), directions (K,d)."""
+    v = np.einsum("nij,wj->nwi", covs_use, W)
+    denom2 = np.einsum("nwi,wi->nw", v, W)
+    denom = np.sqrt(np.clip(denom2, eps, None)).astype(np.float32)
+    pts = means[:, None, :] + k * (v / denom[:, :, None])
+    proj = np.einsum("nwi,wi->nw", pts, W)
+    alpha = proj - penalties[None, :]
+    best_w = np.argmax(alpha, axis=1).astype(np.int32)
+    nloc = alpha.shape[0]
+    scores = alpha[np.arange(nloc), best_w].astype(np.float32)
+    return scores, best_w
+
+
+def _ed_mp_init(W: np.ndarray, penalties: np.ndarray, k: float, eps: float) -> None:
+    global _ED_W, _ED_PEN, _ED_K, _ED_EPS
+    # Limit BLAS threads per worker to avoid oversubscription with many processes.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    _ED_W = np.asarray(W, dtype=np.float32)
+    _ED_PEN = np.asarray(penalties, dtype=np.float32)
+    _ED_K = float(k)
+    _ED_EPS = float(eps)
+
+
+def _ed_mp_run_chunk(pair: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    means_c, covs_c = pair
+    if _ED_W is None or _ED_PEN is None or _ED_K is None or _ED_EPS is None:
+        raise RuntimeError("EllipseDirections worker not initialized")
+    return _ellipse_directions_score_core(
+        np.asarray(means_c, dtype=np.float32),
+        np.asarray(covs_c, dtype=np.float32),
+        _ED_W,
+        _ED_PEN,
+        _ED_K,
+        _ED_EPS,
+    )
+
+
+def _ellipse_directions_mp_config() -> tuple[bool, int, int]:
+    """UCB-style env: ELLIPSE_DIRECTIONS_PARALLEL, ELLIPSE_DIRECTIONS_WORKERS, ELLIPSE_DIRECTIONS_MIN_CHUNK."""
+    pe = os.environ.get("ELLIPSE_DIRECTIONS_PARALLEL", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    nw = max(
+        1,
+        int(
+            os.environ.get(
+                "ELLIPSE_DIRECTIONS_WORKERS",
+                str(min(32, (os.cpu_count() or 1))),
+            )
+        ),
+    )
+    min_chunk = max(1, int(os.environ.get("ELLIPSE_DIRECTIONS_MIN_CHUNK", "128")))
+    return pe, nw, min_chunk
+
+
+def _score_candidates_process_pool(
+    means: np.ndarray,
+    covs_use: np.ndarray,
+    W: np.ndarray,
+    penalties: np.ndarray,
+    k: float,
+    eps: float,
+    *,
+    nw: int,
+    min_chunk: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Chunk candidates across processes (caller ensures pe and N are large enough)."""
+    N = int(means.shape[0])
+    chunk_sz = max(min_chunk, (N + nw - 1) // nw)
+    pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    for i in range(0, N, chunk_sz):
+        pairs.append(
+            (
+                means[i : i + chunk_sz],
+                covs_use[i : i + chunk_sz],
+            )
+        )
+    t0 = time.perf_counter()
+    with ProcessPoolExecutor(
+        max_workers=nw,
+        initializer=_ed_mp_init,
+        initargs=(
+            np.asarray(W, dtype=np.float32),
+            np.asarray(penalties, dtype=np.float32),
+            float(k),
+            float(eps),
+        ),
+    ) as ex:
+        parts = list(ex.map(_ed_mp_run_chunk, pairs))
+    scores = np.concatenate([p[0] for p in parts], axis=0)
+    best_w = np.concatenate([p[1] for p in parts], axis=0)
+    wall = time.perf_counter() - t0
+    logger.info(
+        "[ELLIPSE_DIRECTIONS] score_pipeline workers=%d n_chunks=%d backend=ProcessPoolExecutor "
+        "N=%d wall_s=%.4f",
+        nw,
+        len(pairs),
+        N,
+        wall,
+    )
+    return scores, best_w
 
 
 def circle_directions(n: int) -> np.ndarray:
@@ -32,19 +156,14 @@ def fibonacci_sphere_directions(n: int) -> np.ndarray:
     if n <= 1:
         return np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
 
-    points = []
+    i = np.arange(n, dtype=np.float64)
+    z = 1.0 - (2.0 * i) / (n - 1)
+    radius = np.sqrt(np.maximum(0.0, 1.0 - z * z))
     golden_angle = np.pi * (3.0 - np.sqrt(5.0))
-
-    for i in range(n):
-        z = 1.0 - (2.0 * i) / (n - 1)
-        radius = np.sqrt(max(0.0, 1.0 - z * z))
-        theta = golden_angle * i
-
-        x = np.cos(theta) * radius
-        y = np.sin(theta) * radius
-        points.append([x, y, z])
-
-    W = np.asarray(points, dtype=np.float32)
+    theta = golden_angle * i
+    x = np.cos(theta) * radius
+    y = np.sin(theta) * radius
+    W = np.stack([x, y, z], axis=1).astype(np.float32)
     W /= np.linalg.norm(W, axis=1, keepdims=True)
     return W
 
@@ -258,48 +377,64 @@ class EllipseDirectionAcquisitionFlexible(AcquisitionFunction):
             time.perf_counter() - t0,
         )
 
-        t0 = time.perf_counter()
-        v = np.einsum("nij,wj->nwi", covs_use, W)
-        logger.info(
-            "Ellipse.score: einsum v=Sigma*w took %.6fs | v_shape=%s",
-            time.perf_counter() - t0,
-            v.shape,
-        )
+        pe, nw, min_chunk = _ellipse_directions_mp_config()
+        use_pool = pe and nw > 1 and N >= min_chunk * 2
 
-        t0 = time.perf_counter()
-        denom2 = np.einsum("nwi,wi->nw", v, W)
-        denom = np.sqrt(np.clip(denom2, self.eps, None)).astype(np.float32)
-        logger.info(
-            "Ellipse.score: denom computation took %.6fs | denom_shape=%s",
-            time.perf_counter() - t0,
-            denom.shape,
-        )
+        if use_pool:
+            scores, best_w = _score_candidates_process_pool(
+                means,
+                covs_use,
+                W,
+                penalties,
+                self.k,
+                self.eps,
+                nw=nw,
+                min_chunk=min_chunk,
+            )
+            self.last_w_idx_max = best_w
+        else:
+            t0 = time.perf_counter()
+            v = np.einsum("nij,wj->nwi", covs_use, W)
+            logger.info(
+                "Ellipse.score: einsum v=Sigma*w took %.6fs | v_shape=%s",
+                time.perf_counter() - t0,
+                v.shape,
+            )
 
-        t0 = time.perf_counter()
-        pts = means[:, None, :] + self.k * (v / denom[:, :, None])
-        logger.info(
-            "Ellipse.score: optimistic ellipsoid boundary points took %.6fs | pts_shape=%s",
-            time.perf_counter() - t0,
-            pts.shape,
-        )
+            t0 = time.perf_counter()
+            denom2 = np.einsum("nwi,wi->nw", v, W)
+            denom = np.sqrt(np.clip(denom2, self.eps, None)).astype(np.float32)
+            logger.info(
+                "Ellipse.score: denom computation took %.6fs | denom_shape=%s",
+                time.perf_counter() - t0,
+                denom.shape,
+            )
 
-        t0 = time.perf_counter()
-        proj = np.einsum("nwi,wi->nw", pts, W)
-        alpha = proj - penalties[None, :]
-        logger.info(
-            "Ellipse.score: projection and alpha took %.6fs | alpha_shape=%s",
-            time.perf_counter() - t0,
-            alpha.shape,
-        )
+            t0 = time.perf_counter()
+            pts = means[:, None, :] + self.k * (v / denom[:, :, None])
+            logger.info(
+                "Ellipse.score: optimistic ellipsoid boundary points took %.6fs | pts_shape=%s",
+                time.perf_counter() - t0,
+                pts.shape,
+            )
 
-        t0 = time.perf_counter()
-        best_w = np.argmax(alpha, axis=1).astype(np.int32)
-        scores = alpha[np.arange(N), best_w].astype(np.float32)
-        self.last_w_idx_max = best_w
-        logger.info(
-            "Ellipse.score: argmax and score gather took %.6fs",
-            time.perf_counter() - t0,
-        )
+            t0 = time.perf_counter()
+            proj = np.einsum("nwi,wi->nw", pts, W)
+            alpha = proj - penalties[None, :]
+            logger.info(
+                "Ellipse.score: projection and alpha took %.6fs | alpha_shape=%s",
+                time.perf_counter() - t0,
+                alpha.shape,
+            )
+
+            t0 = time.perf_counter()
+            best_w = np.argmax(alpha, axis=1).astype(np.int32)
+            scores = alpha[np.arange(N), best_w].astype(np.float32)
+            self.last_w_idx_max = best_w
+            logger.info(
+                "Ellipse.score: argmax and score gather took %.6fs",
+                time.perf_counter() - t0,
+            )
 
         if self.clip_negative_hv:
             t0 = time.perf_counter()
