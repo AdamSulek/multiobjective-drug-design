@@ -265,6 +265,8 @@ def main() -> None:
 
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--mc_passes", type=int, default=50)
+    parser.add_argument("--uncertainty-method", choices=("mc_dropout", "last_layer_laplace"), default="mc_dropout")
+    parser.add_argument("--laplace-prior-precision", type=float, default=1.0)
     parser.add_argument("--n_replicates", type=int, default=3)
     parser.add_argument("--output_dir", type=str, default="pal_results")
     parser.add_argument("--device", type=str, default="cpu")
@@ -365,6 +367,8 @@ def main() -> None:
 
     config.model.epochs = args.epochs
     config.model.mc_passes = args.mc_passes
+    config.model.uncertainty_method = args.uncertainty_method
+    config.model.laplace_prior_precision = args.laplace_prior_precision
     config.model.patience = args.patience
     config.model.min_epochs = args.min_epochs
     config.model.weight_decay = args.weight_decay

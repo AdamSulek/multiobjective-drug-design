@@ -74,6 +74,57 @@ class MLP(nn.Module):
         return self.head(self.backbone(x))
 
 
+class PiALMultilabelMLP(nn.Module):
+    """Shared ECFP encoder with one regression and two multilabel heads."""
+
+    def __init__(
+        self,
+        in_features: int = 2048,
+        hidden_sizes: tuple[int, ...] = (1024, 512, 256),
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        layers: list[nn.Module] = []
+        previous = int(in_features)
+        for hidden in hidden_sizes:
+            layers.extend((nn.Linear(previous, int(hidden)), nn.ReLU()))
+            if dropout > 0:
+                layers.append(nn.Dropout(float(dropout)))
+            previous = int(hidden)
+        self.encoder = nn.Sequential(*layers)
+        self.docking_head = nn.Linear(previous, 1)
+        self.selected_head = nn.Linear(previous, 8)
+        self.remaining_head = nn.Linear(previous, 48)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        embedding = self.encoder(x)
+        return (
+            self.docking_head(embedding),
+            self.selected_head(embedding),
+            self.remaining_head(embedding),
+        )
+
+    def probabilities(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        docking, selected_logits, remaining_logits = self(x)
+        return docking, torch.sigmoid(selected_logits), torch.sigmoid(remaining_logits)
+
+    def acquisition_outputs(self, x: torch.Tensor) -> torch.Tensor:
+        """Return docking and expected selected/remaining counts."""
+        docking, selected_probs, remaining_probs = self.probabilities(x)
+        return torch.cat(
+            (
+                docking,
+                selected_probs.sum(dim=1, keepdim=True),
+                remaining_probs.sum(dim=1, keepdim=True),
+            ),
+            dim=1,
+        )
+
+
 class MoleculeDataset(Dataset):
     """Simple dataset wrapping numpy feature and label arrays."""
 
@@ -86,6 +137,29 @@ class MoleculeDataset(Dataset):
 
     def __getitem__(self, idx: int):
         return self.X[idx], self.Y[idx]
+
+
+class PiALMultilabelDataset(Dataset):
+    def __init__(
+        self,
+        X: np.ndarray,
+        docking: np.ndarray,
+        selected: np.ndarray,
+        remaining: np.ndarray,
+    ):
+        n = len(X)
+        if np.asarray(selected).shape != (n, 8) or np.asarray(remaining).shape != (n, 48):
+            raise ValueError("Expected selected (N,8) and remaining (N,48)")
+        self.X = torch.from_numpy(np.asarray(X)).float()
+        self.docking = torch.from_numpy(np.asarray(docking).reshape(n, 1)).float()
+        self.selected = torch.from_numpy(np.asarray(selected)).float()
+        self.remaining = torch.from_numpy(np.asarray(remaining)).float()
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def __getitem__(self, idx: int):
+        return self.X[idx], self.docking[idx], self.selected[idx], self.remaining[idx]
 
 
 def build_model(cfg: ModelConfig, device: str = "cpu", out_features: int | None = None) -> MLP:
@@ -101,6 +175,17 @@ def build_model(cfg: ModelConfig, device: str = "cpu", out_features: int | None 
         out_features=of,
     ).to(device)
     return model
+
+
+def build_pial_multilabel_model(
+    cfg: ModelConfig, device: str = "cpu"
+) -> PiALMultilabelMLP:
+    """Build the canonical 1-regression + 8/48-multilabel PiAL model."""
+    return PiALMultilabelMLP(
+        in_features=int(cfg.in_features),
+        hidden_sizes=tuple(cfg.hidden_sizes),
+        dropout=float(cfg.dropout),
+    ).to(device)
 
 
 def train_model(
@@ -339,3 +424,104 @@ def predict_eval(
 
     model.train()
     return torch.cat(preds, dim=0).numpy()
+
+def train_pial_multilabel_model(
+    model: PiALMultilabelMLP,
+    X: np.ndarray,
+    docking: np.ndarray,
+    selected: np.ndarray,
+    remaining: np.ndarray,
+    *,
+    epochs: int = 50,
+    batch_size: int = 256,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-5,
+    device: str = "cpu",
+) -> dict[str, float]:
+    """Train with equally weighted MSE, selected BCE and remaining BCE."""
+    dataset = PiALMultilabelDataset(X, docking, selected, remaining)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    docking_loss_fn = nn.MSELoss()
+    selected_loss_fn = nn.BCEWithLogitsLoss()
+    remaining_loss_fn = nn.BCEWithLogitsLoss()
+    latest = {"docking": float("nan"), "selected": float("nan"), "remaining": float("nan")}
+
+    model.train()
+    for _ in range(epochs):
+        sums = {name: 0.0 for name in latest}
+        for xb, docking_target, selected_target, remaining_target in loader:
+            xb = xb.to(device)
+            docking_target = docking_target.to(device)
+            selected_target = selected_target.to(device)
+            remaining_target = remaining_target.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            docking_pred, selected_logits, remaining_logits = model(xb)
+            losses = {
+                "docking": docking_loss_fn(docking_pred, docking_target),
+                "selected": selected_loss_fn(selected_logits, selected_target),
+                "remaining": remaining_loss_fn(remaining_logits, remaining_target),
+            }
+            (losses["docking"] + losses["selected"] + losses["remaining"]).backward()
+            optimizer.step()
+            for name, loss in losses.items():
+                sums[name] += float(loss.detach().cpu()) * len(xb)
+        latest = {name: value / len(dataset) for name, value in sums.items()}
+    latest["total"] = latest["docking"] + latest["selected"] + latest["remaining"]
+    return latest
+
+
+def predict_pial_outputs(
+    model: PiALMultilabelMLP,
+    X: np.ndarray,
+    *,
+    batch_size: int = 2048,
+    device: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return docking, logits probabilities and expected counts deterministically."""
+    model.eval()
+    X_t = torch.from_numpy(np.asarray(X)).float()
+    docking_parts, selected_parts, remaining_parts = [], [], []
+    with torch.no_grad():
+        for start in range(0, len(X_t), batch_size):
+            xb = X_t[start:start + batch_size].to(device, non_blocking=True)
+            docking, selected_logits, remaining_logits = model(xb)
+            docking_parts.append(docking.cpu())
+            selected_parts.append(torch.sigmoid(selected_logits).cpu())
+            remaining_parts.append(torch.sigmoid(remaining_logits).cpu())
+    docking = torch.cat(docking_parts).numpy()
+    selected_probs = torch.cat(selected_parts).numpy()
+    remaining_probs = torch.cat(remaining_parts).numpy()
+    selected_count = selected_probs.sum(axis=1)
+    remaining_count = remaining_probs.sum(axis=1)
+    return docking, selected_probs, remaining_probs, selected_count, remaining_count
+
+
+def mc_predict_pial_counts(
+    model: PiALMultilabelMLP,
+    X: np.ndarray,
+    *,
+    n_passes: int = 50,
+    batch_size: int = 2048,
+    device: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply existing MC mean/covariance rules to docking and probability counts."""
+    if n_passes <= 0:
+        raise ValueError("n_passes must be positive")
+    model.train()
+    X_t = torch.from_numpy(np.asarray(X)).float()
+    means, covariances = [], []
+    with torch.no_grad():
+        for start in range(0, len(X_t), batch_size):
+            xb = X_t[start:start + batch_size].to(device, non_blocking=True)
+            runs = torch.stack([model.acquisition_outputs(xb) for _ in range(n_passes)])
+            means.append(runs.mean(dim=0).cpu())
+            centered = runs - runs.mean(dim=0, keepdim=True)
+            denominator = max(n_passes - 1, 1)
+            covariances.append(
+                torch.einsum("tni,tnj->nij", centered, centered).div(denominator).cpu()
+            )
+    mean = torch.cat(means).numpy()
+    covariance = torch.cat(covariances).numpy()
+    std = np.sqrt(np.maximum(np.diagonal(covariance, axis1=1, axis2=2), 1e-9))
+    return mean, std, covariance

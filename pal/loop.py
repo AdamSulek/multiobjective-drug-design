@@ -10,6 +10,7 @@ import numpy as np
 from .acquisition.base import AcquisitionFunction
 from .config import ExperimentConfig
 from .model import build_model, mc_predict, predict_eval, train_model
+from .uncertainty import fit_last_layer_laplace, predict_with_uncertainty
 from .pareto import hypervolume_2d
 from .pareto_3D import (
     pareto_front_3d_max,
@@ -179,6 +180,18 @@ def run_al_loop(
             )
         t_train = time.perf_counter() - t0
 
+        laplace_state = None
+        if mcfg.uncertainty_method == "last_layer_laplace":
+            with timed("fit_last_layer_laplace"):
+                laplace_state = fit_last_layer_laplace(
+                    model,
+                    X_train,
+                    Y_train_norm,
+                    prior_precision=mcfg.laplace_prior_precision,
+                    batch_size=mcfg.batch_size,
+                    device=config.device,
+                )
+
         # training metrics (denormalize predictions)
         t0 = time.perf_counter()
         with timed("predict_eval(train)"):
@@ -199,7 +212,7 @@ def run_al_loop(
         # - if strategy needs full covariance (ellipse*), do cheap mean on whole pool,
         #   and MC+cov only on top-K later.
         # - otherwise do normal MC on whole pool (what you had).
-        if needs_cov:
+        if needs_cov and mcfg.uncertainty_method == "mc_dropout":
             # --- A) cheap global pass (NO MC, NO cov) ---
             t0 = time.perf_counter()
             with timed("predict_eval(unlabeled)"):
@@ -209,14 +222,16 @@ def run_al_loop(
             stds = None
             covs = None
         elif needs_uncertainty:
-            # --- normal path (MC on whole unlabeled) ---
+            # Both backends return normalized mean/std/cov here.
             t0 = time.perf_counter()
-            with timed("mc_predict(unlabeled)"):
-                means, stds, covs = mc_predict(
+            with timed("predict_with_uncertainty(unlabeled)"):
+                means, stds, covs = predict_with_uncertainty(
                     model,
                     X_unlabeled,
-                    n_passes=mcfg.mc_passes,
+                    uncertainty_method=mcfg.uncertainty_method,
+                    mc_passes=mcfg.mc_passes,
                     device=config.device,
+                    laplace_state=laplace_state,
                 )
             t_pred_unlabeled = time.perf_counter() - t0
             means = means * Y_std + Y_mean
@@ -295,23 +310,28 @@ def run_al_loop(
             else:
                 top_local = top_part
 
-            # 4) MC+cov ONLY on top_local
+            # Laplace already encoded the full pool once; just slice top-K.
             X_top = X_unlabeled[top_local]
             logging.info(f"[TOPK] it={it} U={U} K={len(top_local)} (top={K_top}, rand={len(top_local)-K_top})")
-            
-            t0 = time.perf_counter()
-            with timed("mc_predict(topK cov)"):
-                means_top, stds_top, covs_top = mc_predict(
-                    model,
-                    X_top,
-                    n_passes=mcfg.mc_passes,
-                    device=config.device,
-                )
-            t_pred_topk = time.perf_counter() - t0
 
-            means_top = means_top * Y_std + Y_mean
-            stds_top = stds_top * Y_std
-            covs_top = covs_top * np.outer(Y_std, Y_std)[None, :, :]
+            if mcfg.uncertainty_method == "last_layer_laplace":
+                means_top = means[top_local]
+                stds_top = stds[top_local]
+                covs_top = covs[top_local]
+            else:
+                t0 = time.perf_counter()
+                with timed("mc_predict(topK cov)"):
+                    means_top, stds_top, covs_top = mc_predict(
+                        model,
+                        X_top,
+                        n_passes=mcfg.mc_passes,
+                        device=config.device,
+                    )
+                t_pred_topk = time.perf_counter() - t0
+
+                means_top = means_top * Y_std + Y_mean
+                stds_top = stds_top * Y_std
+                covs_top = covs_top * np.outer(Y_std, Y_std)[None, :, :]
     
         t0 = time.perf_counter()
         with timed("acquisition.select()"):

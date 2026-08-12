@@ -17,6 +17,8 @@ class ModelConfig:
     dropout: float = 0.3
     out_features: int = 2
     mc_passes: int = 50
+    uncertainty_method: str = "mc_dropout"
+    laplace_prior_precision: float = 1.0
     epochs: int = 200
     batch_size: int = 64
     lr: float = 1e-3

@@ -8,6 +8,41 @@ The methodology is applied to molecular docking results, with the goal of improv
 
 The project aims to support more efficient and informed decision-making in computational drug discovery workflows.
 
+## PiAL data and multilabel model
+
+PiAL reads the shared data in place; these files must not be copied or moved into this repository:
+
+- `/net/storage/pr3/plgrid/plggsanodrugs/pial/data/dataset.h5` contains the molecular input data used by the pipeline.
+- `/net/storage/pr3/plgrid/plggsanodrugs/pial/data/initial_datasets/` contains the initial labeled sets for the Active Learning seeds.
+- `/net/storage/pr3/plgrid/plggsanodrugs/pial/data/pareto_dimensions.parquet` contains the three aggregated Pareto dimensions, including the selected and remaining interaction counts.
+- `/net/storage/pr3/plgrid/plggsanodrugs/pial/docking/data/ampc_1L2S_B_training_PLIF.parquet` contains the full binary PLIF source vectors.
+- `/net/storage/pr3/plgrid/plggsanodrugs/pial/data/pareto_plif_feature_mapping.tsv` defines the aggregation and the split into 8 selected and 48 remaining PLIF features.
+
+The current PiAL predictor uses a shared ECFP encoder and three task-specific heads:
+
+- `docking_head`: one regression output trained against `-docking_score`;
+- `selected_head`: 8 logits for the selected/pocket PLIF features;
+- `remaining_head`: 48 logits for the remaining PLIF features.
+
+Training uses equally weighted losses: `MSELoss` for docking and `BCEWithLogitsLoss` for each multilabel interaction head (`MSE + BCE + BCE`, weights `1:1:1`). The two interaction heads predict individual binary PLIF targets rather than scalar interaction counts.
+
+For the existing three-dimensional acquisition interface, inference applies sigmoid to the interaction logits and aggregates expected counts:
+
+```text
+selected_mean_count = sigmoid(selected_logits).sum(dim=1)
+remaining_mean_count = sigmoid(remaining_logits).sum(dim=1)
+```
+
+This preserves the acquisition objectives `(docking, selected count, remaining count)` without changing UCB, HV/HVI, or ellipse acquisition implementations. MC dropout supports the multilabel model and exposes the existing `(means, stds, covs)` contract after count aggregation. Last-Layer Laplace is deliberately blocked for this architecture until a posterior implementation for the multilabel heads is added; it fails explicitly instead of silently returning incompatible uncertainty.
+
+## PiAL roadmap
+
+- Analyze class imbalance across the 8 + 48 PLIF targets and evaluate `pos_weight` if needed.
+- Tune MLP hyperparameters with fixed data splits, seeds, targets, and normalization.
+- Implement Last-Layer Laplace for the multilabel selected and remaining heads.
+- Compare UCB variants for aggregated interaction probabilities/counts.
+
+
 ## Complexity and Time Benchmark on Synthetic Data
 
 To evaluate the computational complexity and runtime behavior of the considered methods, synthetic datasets with controlled structure were generated. A total of (N = 10 000) samples were drawn in a five-dimensional space and subsequently projected onto lower dimensions (d in {2, 3, 4, 5}).
